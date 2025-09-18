@@ -1,87 +1,115 @@
 from flask import Flask, jsonify, request, Response, redirect, url_for
 import threading, time, uuid, json, os, subprocess
 import pandas as pd
-import plotly.express as px
 
 app = Flask(__name__)
 
-JOBS = {}        # job_id -> {"status": "...", "df_json": str|None, "err": str|None, "log": list[str]}
-LAST_JOB = None
+JOBS = {}  # job_id -> {"status": "...", "df_json": str|None, "err": str|None, "log": list[str]}
 
 CSV_NAME = os.getenv("SCREENER_CSV", "usdt_screener.csv")
 SCRIPT    = os.getenv("SCREENER_SCRIPT", "Binance_usdt_2.py")
-# Quitamos timeout aquí: dejaremos que el propio script se autorregule por DEADLINE
-# TIMEOUT_S = int(os.getenv("SCREENER_TIMEOUT", "240"))
+DFJSON_MARK = "__DFJSON__="  # marcador para recibir el DF por stdout
 
 def _append_log(job_id: str, line: str):
-    if job_id in JOBS:
-        JOBS[job_id]["log"].append(line[-400])
+    if not line:
+        return
+    # <= arregla IndexError; guardamos hasta 400 chars de caudal
+    JOBS[job_id]["log"].append(line[-400:])
 
-def _run_pipeline_and_load_df(job_id: str) -> pd.DataFrame:
+def _run_pipeline_and_get_df(job_id: str) -> pd.DataFrame:
     """
-    Ejecuta el script en subproceso SIN timeout. Captura progreso (stderr/stdout).
-    El propio script corta por DEADLINE y siempre intenta producir CSV parcial.
+    Lanza el script SIN timeout duro. Si el script imprime una línea
+    que empieza por '__DFJSON__=', tomamos ese JSON como DataFrame.
+    Si no, intentamos cargar el CSV si existe (fallback).
     """
-    # heredamos env + ponemos un DEADLINE por si no está definido
     env = os.environ.copy()
-    env.setdefault("DEADLINE_S", "180")  # 3 min objetivo dentro del plan free
+    env.setdefault("DEADLINE_S", "180")  # control del propio script
 
     proc = subprocess.Popen(
         ["python", SCRIPT],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=env
+        env=env,
+        bufsize=1
     )
-    # leer pipes en “poll”
+
+    df_json_line = None
+
+    # leer ambas tuberías de forma incremental
     while True:
         ret = proc.poll()
-        # volcamos streams sin bloquear
-        if proc.stderr:
-            line = proc.stderr.readline()
-            if line:
-                _append_log(job_id, line.strip())
+
+        # stdout
         if proc.stdout:
-            line = proc.stdout.readline()
-            if line:
-                _append_log(job_id, line.strip())
+            s = proc.stdout.readline()
+            if s:
+                s = s.rstrip("\n")
+                if s.startswith(DFJSON_MARK) and df_json_line is None:
+                    # capturamos el JSON de datos
+                    df_json_line = s[len(DFJSON_MARK):].strip()
+                else:
+                    _append_log(job_id, s)
+
+        # stderr
+        if proc.stderr:
+            e = proc.stderr.readline()
+            if e:
+                _append_log(job_id, e.rstrip("\n"))
+
         if ret is not None:
             break
-        time.sleep(0.05)
+        time.sleep(0.02)
 
-    if proc.returncode != 0:
-        # aun así, intentamos leer CSV parcial si existe
-        _append_log(job_id, f"[warn] script exited {proc.returncode}")
-    # Cargar CSV si existe
-    if not os.path.exists(CSV_NAME):
-        raise FileNotFoundError(f"CSV '{CSV_NAME}' no fue creado por {SCRIPT}")
-    try:
-        df = pd.read_csv(CSV_NAME)
-    finally:
-        try: os.remove(CSV_NAME)
-        except Exception: pass
-    return df
+    # 1) Si recibimos JSON por stdout, lo usamos (preferido)
+    if df_json_line:
+        try:
+            data = json.loads(df_json_line)
+            return pd.DataFrame(data)
+        except Exception as ex:
+            _append_log(job_id, f"[warn] DFJSON inválido: {ex!r}")
+
+    # 2) Fallback: intentar CSV si existe (para compatibilidad)
+    if os.path.exists(CSV_NAME):
+        try:
+            df = pd.read_csv(CSV_NAME)
+            try:
+                os.remove(CSV_NAME)
+            except Exception:
+                pass
+            return df
+        except Exception as ex:
+            _append_log(job_id, f"[warn] CSV inválido: {ex!r}")
+
+    # 3) Error si no hay ni JSON ni CSV
+    raise RuntimeError("No se recibió DF por stdout ni se generó CSV")
 
 def _job_runner(job_id: str):
     JOBS[job_id]["status"] = "running"
     try:
-        df = _run_pipeline_and_load_df(job_id)
-        # columnas preferidas si existen
-        preferred = ["symbol","price","pct_change_24h","pct_change_48h",
-                     "quote_volume_24h","Trend_4H","ScoreAdj","ScoreTrend",
-                     "fundingRate","openInterest"]
+        df = _run_pipeline_and_get_df(job_id)
+
+        # Normalización suave de columnas esperadas
+        preferred = [
+            "symbol","price","pct_change_24h","pct_change_48h",
+            "quote_volume_24h","Trend_4H","ScoreAdj","ScoreTrend",
+            "fundingRate","openInterest"
+        ]
         cols = [c for c in preferred if c in df.columns]
         if cols:
             df = df[cols].copy()
+
         for c in ("price","pct_change_24h","pct_change_48h","quote_volume_24h",
                   "fundingRate","openInterest","ScoreAdj","ScoreTrend"):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+
         if len(df) > 500:
             df = df.head(500)
+
         JOBS[job_id]["df_json"] = df.to_json(orient="records")
         JOBS[job_id]["status"] = "done"
-        _append_log(job_id, f"[ok] rows={len(df)}")
+        _append_log(job_id, f"[ok] filas={len(df)}")
     except Exception as e:
         JOBS[job_id]["status"] = "error"
         JOBS[job_id]["err"] = repr(e)
@@ -110,6 +138,7 @@ pre{{white-space:pre-wrap;max-height:220px;overflow:auto;background:#0b1220;colo
 </body></html>"""
 
 def _render_dashboard(df: pd.DataFrame) -> str:
+    import plotly.express as px
     has_pct = "pct_change_24h" in df.columns
     has_vol = "quote_volume_24h" in df.columns
     has_trend = "Trend_4H" in df.columns
@@ -118,9 +147,7 @@ def _render_dashboard(df: pd.DataFrame) -> str:
     has_fund = "fundingRate" in df.columns
 
     total = len(df)
-    trends = df["Trend_4H"].value_counts().to_dict() if has_trend else {}
 
-    import plotly.express as px
     if has_pct:
         movers = df.dropna(subset=["pct_change_24h"]).copy()
         movers["abs_move"] = movers["pct_change_24h"].abs()
@@ -133,6 +160,8 @@ def _render_dashboard(df: pd.DataFrame) -> str:
 
     if has_vol:
         vol = df.dropna(subset=["quote_volume_24h"]).sort_values("quote_volume_24h", ascending=False).head(20)
+        fig2 = pd.DataFrame(vol)
+        import plotly.express as px
         fig2 = px.bar(vol, x="symbol", y="quote_volume_24h", title="Top 20 by 24h Quote Volume (USDT)")
         fig2.update_layout(margin=dict(l=20,r=20,t=40,b=20), height=360)
         vol_div = fig2.to_html(full_html=False, include_plotlyjs=False)
@@ -150,7 +179,6 @@ def _render_dashboard(df: pd.DataFrame) -> str:
     else:
         fdo_div = "<div class='muted'>Funding/OI not available</div>"
 
-    # tabla
     table_cols = [c for c in ["symbol","price","pct_change_24h","pct_change_48h","quote_volume_24h","Trend_4H","ScoreTrend","fundingRate","openInterest"] if c in df.columns]
     if "quote_volume_24h" in table_cols:
         table_df = df.sort_values("quote_volume_24h", ascending=False).head(100)[table_cols]
@@ -182,17 +210,13 @@ def _render_dashboard(df: pd.DataFrame) -> str:
       <div>
         <a class="btn" href="/" title="Home">Home</a>
         <a class="btn" href="/start" title="Run again">Run again</a>
-        <span class="muted">Free tier: primer acceso puede tardar mientras despierta.</span>
       </div>
     </div>
 
     <div class="grid">
       <div class="card">
         <div class="header"><h3>Resumen</h3><span class="badge">{total} símbolos</span></div>
-        <div class="muted">4H Trend breakdown:</div>
-        <div style="margin-top:8px">
-          {"".join([f'<span class="badge" style="margin-right:6px">{k}: {v}</span>' for k,v in (df["Trend_4H"].value_counts().to_dict() if "Trend_4H" in df.columns else {}).items()]) or "<span class='muted'>N/A</span>"}
-        </div>
+        <div class="muted">4H Trend breakdown visible en tabla.</div>
       </div>
       <div class="card">{movers_div}</div>
       <div class="card">{vol_div}</div>

@@ -209,5 +209,16 @@ def run_screener():
     except Exception as e:
         log(f"[warn] no se pudo guardar CSV: {e}")
 
-if __name__ == "__main__":
-    run_screener()
+   
+    #----
+    if __name__ == "__main__":
+    df = build_df()
+    # Enviar el DF al servidor por stdout (sin CSV)
+    try:
+        import json
+        print("__DFJSON__=" + df.to_json(orient="records"), flush=True)
+    except Exception as e:
+        # fallback opcional: si quisieras seguir guardando CSV en caso de error, descomenta:
+        # df.to_csv(os.getenv("SCREENER_CSV", "usdt_screener.csv"), index=False)
+        print(f"[warn] no se pudo emitir DFJSON: {e}", flush=True)
+
