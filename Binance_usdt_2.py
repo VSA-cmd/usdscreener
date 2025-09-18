@@ -1,224 +1,191 @@
-# -*- coding: utf-8 -*-
-"""
-Binance_usdt_2.py — screener USDT para Binance global con DEADLINE suave.
-Genera siempre un CSV (parcial o completo) para que la app lo lea.
+import os
+import sys
+import time
+import json
+from typing import List, Dict, Any, Optional
 
-Vars de entorno útiles:
-- TOPN_FOR_DEEP (por defecto 80)   → símbolos “profundos” con klines/futuros
-- KLINES_LIMIT (por defecto 60)
-- DEADLINE_S   (por defecto 180)   → tiempo máximo blando para terminar
-- SCREENER_CSV (por defecto usdt_screener.csv)
-"""
-
-from __future__ import annotations
-import os, time, math, random
-from typing import Any, Dict, Optional, Tuple, List
 import requests
 import pandas as pd
-import numpy as np
 
-CSV_NAME = os.getenv("SCREENER_CSV", "usdt_screener.csv")
-SPOT_BASE = "https://api.binance.com"
-FAPI_BASE = "https://fapi.binance.com"
 
-TOPN_FOR_DEEP = int(os.getenv("TOPN_FOR_DEEP", "80"))
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "60"))
-DEADLINE_S = int(os.getenv("DEADLINE_S", "180"))
+# -------------------------------
+# Config por entorno
+# -------------------------------
+FORCE_GLOBAL = os.environ.get("FORCE_GLOBAL", "").strip() == "1"
+BINANCE_REGION = (os.environ.get("BINANCE_REGION", "") or "").upper().strip()
 
-HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
-HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "25"))
-HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "5"))
-HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "0.8"))
+if FORCE_GLOBAL or BINANCE_REGION not in {"US"}:
+    SPOT_BASE = "https://api.binance.com"
+    FUTU_BASE = "https://fapi.binance.com"  # futures (USDT-m)
+else:
+    # Región USA (spot). Futures no expuestos igual que global; omitir métricas futures si no hay FORCE_GLOBAL
+    SPOT_BASE = "https://api.binance.us"
+    FUTU_BASE = None  # deshabilitado en modo US
 
-EXCLUDE_SUFFIXES = ("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT","VENUSDT")
 
-sess = requests.Session()
-sess.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/118 Safari/537.36"
-})
-
-def log(msg: str):  # visible en /view (stderr/ stdout)
+# -------------------------------
+# Helpers HTTP
+# -------------------------------
+def _get(url: str, params: Dict[str, Any] = None, timeout: int = 12) -> Optional[Any]:
     try:
-        print(msg, flush=True)
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[warn] GET failed {url} -> {repr(e)}", file=sys.stderr, flush=True)
+        return None
+
+
+# -------------------------------
+# Data builders
+# -------------------------------
+def fetch_24h_tickers_usdt(limit_symbols: int = 20) -> List[Dict[str, Any]]:
+    """Trae todos los tickers 24h y filtra los que terminan en USDT; devuelve top por quoteVolume."""
+    url = f"{SPOT_BASE}/api/v3/ticker/24hr"
+    data = _get(url) or []
+    rows = []
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            rows.append({
+                "symbol": sym,
+                "price": float(d.get("lastPrice") or d.get("weightedAvgPrice") or 0.0),
+                "pct_change_24h": float(d.get("priceChangePercent") or 0.0) / 100.0,
+                "quote_volume_24h": float(d.get("quoteVolume") or 0.0),
+            })
+        except Exception:
+            # si hay campos corruptos, ignora esa fila
+            continue
+    # ordenar por volumen desc y limitar
+    rows.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
+    return rows[:limit_symbols] if rows else []
+
+
+def fetch_klines_close(symbol: str, interval: str = "4h", limit: int = 30) -> List[float]:
+    url = f"{SPOT_BASE}/api/v3/klines"
+    data = _get(url, {"symbol": symbol, "interval": interval, "limit": limit})
+    closes = []
+    if isinstance(data, list):
+        for item in data:
+            try:
+                closes.append(float(item[4]))  # close
+            except Exception:
+                pass
+    return closes
+
+
+def compute_trend_4h(closes: List[float]) -> Dict[str, Any]:
+    if not closes or len(closes) < 2:
+        return {"Trend_4H": None, "ScoreTrend": None}
+    c0 = closes[0]
+    c1 = closes[-1]
+    chg = (c1 - c0) / c0 if c0 else 0.0
+    label = "Alcista" if chg > 0.01 else ("Bajista" if chg < -0.01 else "Lateral")
+    score = round(float(chg), 4)
+    return {"Trend_4H": label, "ScoreTrend": score}
+
+
+def fetch_funding_rate(symbol: str) -> Optional[float]:
+    if not FUTU_BASE:
+        return None
+    url = f"{FUTU_BASE}/fapi/v1/fundingRate"
+    data = _get(url, {"symbol": symbol, "limit": 1})
+    try:
+        if isinstance(data, list) and data:
+            return float(data[0].get("fundingRate") or 0.0)
     except Exception:
         pass
+    return None
 
-def http_get(url: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-    backoff = HTTP_BACKOFF
-    last = None
-    for attempt in range(1, HTTP_MAX_RETRIES + 1):
+
+def fetch_open_interest(symbol: str) -> Optional[float]:
+    if not FUTU_BASE:
+        return None
+    url = f"{FUTU_BASE}/fapi/v1/openInterest"
+    data = _get(url, {"symbol": symbol})
+    try:
+        if isinstance(data, dict) and "openInterest" in data:
+            return float(data["openInterest"])
+    except Exception:
+        pass
+    return None
+
+
+def build_df(limit_symbols: int = 20) -> pd.DataFrame:
+    # 1) Top por volumen USDT (spot)
+    tickers = fetch_24h_tickers_usdt(limit_symbols=limit_symbols)
+    if not tickers:
+        # fallback muy pequeño para que nunca explote: BTC y ETH si todo falla
+        tickers = [
+            {"symbol": "BTCUSDT", "price": None, "pct_change_24h": None, "quote_volume_24h": None},
+            {"symbol": "ETHUSDT", "price": None, "pct_change_24h": None, "quote_volume_24h": None},
+        ]
+
+    out_rows = []
+    for t in tickers:
+        sym = t["symbol"]
+        # 2) Trend 4H
+        closes = fetch_klines_close(sym, "4h", 30)
+        trend = compute_trend_4h(closes)
+
+        # 3) Futures metrics (si aplica)
+        fr = fetch_funding_rate(sym)
+        oi = fetch_open_interest(sym)
+
+        out_rows.append({
+            "symbol": sym,
+            "price": t.get("price"),
+            "pct_change_24h": t.get("pct_change_24h"),
+            "quote_volume_24h": t.get("quote_volume_24h"),
+            "Trend_4H": trend["Trend_4H"],
+            "ScoreTrend": trend["ScoreTrend"],
+            "fundingRate": fr,
+            "openInterest": oi,
+        })
+
+        # pequeña pausa para no golpear límites si hay muchas llamadas
+        time.sleep(0.05)
+
+    df = pd.DataFrame(out_rows)
+    # Orden por volumen si existe
+    if "quote_volume_24h" in df.columns:
+        df = df.sort_values("quote_volume_24h", ascending=False, na_position="last").reset_index(drop=True)
+    return df
+
+
+# -------------------------------
+# Main: imprime JSON para app.py
+# -------------------------------
+if __name__ == "__main__":
+    try:
+        # puedes ajustar el límite por env si quieres: LIMIT_SYMBOLS=20
+        limit = int(os.environ.get("LIMIT_SYMBOLS", "20"))
+    except Exception:
+        limit = 20
+
+    df = build_df(limit_symbols=limit)
+
+    # Asegurar tipos serializables
+    def _to_float(x):
         try:
-            r = sess.get(url, params=params, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT))
-            if r.status_code == 451:
-                raise requests.HTTPError("451 Unavailable for legal reasons")
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if "json" not in ct and "javascript" not in ct and "text/plain" not in ct:
-                if "<html" in r.text.lower()[:200]:
-                    raise requests.HTTPError("Unexpected HTML")
-            r.raise_for_status()
-            return r
-        except Exception as e:  # noqa: BLE001
-            last = e
-            if attempt >= HTTP_MAX_RETRIES:
-                break
-            time.sleep(backoff * (1 + random.random()))
-            backoff *= 1.6
-    raise requests.RequestException(f"GET failed: {last}")
+            return float(x)
+        except Exception:
+            return None
 
-def fetch_spot() -> pd.DataFrame:
-    url = f"{SPOT_BASE}/api/v3/ticker/24hr"
-    data = http_get(url).json()
-    df = pd.DataFrame(data)
-    num_cols = ["lastPrice","priceChangePercent","quoteVolume","openPrice","prevClosePrice"]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[df["symbol"].str.endswith("USDT", na=False)].copy()
-    for bad in EXCLUDE_SUFFIXES:
-        df = df[~df["symbol"].str.endswith(bad, na=False)]
-    df.rename(columns={
-        "lastPrice":"price","priceChangePercent":"pct_change_24h","quoteVolume":"quote_volume_24h"
-    }, inplace=True)
-    df.sort_values("quote_volume_24h", ascending=False, inplace=True)
-    keep = ["symbol","price","pct_change_24h","quote_volume_24h","openPrice","prevClosePrice"]
-    for c in keep:
-        if c not in df.columns: df[c] = np.nan
-    return df.reset_index(drop=True)
+    safe = []
+    for _, r in df.iterrows():
+        safe.append({
+            "symbol": r.get("symbol"),
+            "price": _to_float(r.get("price")),
+            "pct_change_24h": _to_float(r.get("pct_change_24h")),
+            "quote_volume_24h": _to_float(r.get("quote_volume_24h")),
+            "Trend_4H": r.get("Trend_4H"),
+            "ScoreTrend": _to_float(r.get("ScoreTrend")),
+            "fundingRate": _to_float(r.get("fundingRate")),
+            "openInterest": _to_float(r.get("openInterest")),
+        })
 
-def fetch_klines_4h(symbol: str, limit: int) -> Optional[pd.DataFrame]:
-    url = f"{SPOT_BASE}/api/v3/klines"
-    params = {"symbol": symbol, "interval": "4h", "limit": limit}
-    try:
-        arr = http_get(url, params).json()
-        if not arr: return None
-        cols=["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"]
-        df = pd.DataFrame(arr, columns=cols)
-        for c in ("open","high","low","close","volume","qav","takerBase","takerQuote"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
-    except Exception:
-        return None
-
-def compute_trend_and_48h(dfk: Optional[pd.DataFrame]) -> Tuple[Optional[str], Optional[float]]:
-    if dfk is None or dfk.empty: return None, None
-    close = dfk["close"].astype(float).to_numpy()
-    if len(close) < 13: return None, None
-    last, prev = float(close[-1]), float(close[-13])
-    pct48 = (last/prev - 1.0) if prev>0 else None
-    sma = pd.Series(close).rolling(3).mean().dropna()
-    if len(sma) < 6: return None, pct48
-    slope = float(sma.iloc[-1] - sma.iloc[-6])
-    pct_slope = slope / max(1e-9, float(sma.iloc[-6]))
-    if pct_slope > 0.006: tr="Alcista"
-    elif pct_slope < -0.006: tr="Bajista"
-    else: tr="Lateral"
-    return tr, pct48
-
-def fetch_funding(symbol: str) -> Optional[float]:
-    url = f"{FAPI_BASE}/fapi/v1/fundingRate"
-    try:
-        data = http_get(url, {"symbol": symbol, "limit":1}).json()
-        if isinstance(data, list) and data:
-            return float(data[-1].get("fundingRate","nan"))
-    except Exception:
-        return None
-    return None
-
-def fetch_oi(symbol: str) -> Optional[float]:
-    url = f"{FAPI_BASE}/futures/data/openInterestHist"
-    try:
-        data = http_get(url, {"symbol": symbol, "period":"8h", "limit":1}).json()
-        if isinstance(data, list) and data:
-            return float(data[-1].get("sumOpenInterest","nan"))
-    except Exception:
-        return None
-    return None
-
-def now(): return time.time()
-
-def build_df() -> pd.DataFrame:
-    t0 = now()
-    log("[1/4] Descargando tickers 24h...")
-    spot = fetch_spot()
-    if spot.empty:
-        log("[warn] spot vacío; devolviendo placeholder")
-        return pd.DataFrame([{"symbol":"BTCUSDT","price":116000,"pct_change_24h":0.01,"quote_volume_24h":1.8e9,"Trend_4H":"Alcista","ScoreTrend":0.8,"fundingRate":8.1e-5,"openInterest":88000}])
-
-    for c in ["pct_change_48h","Trend_4H","ScoreTrend","fundingRate","openInterest"]:
-        if c not in spot.columns: spot[c]=np.nan
-
-    deep = spot["symbol"].head(TOPN_FOR_DEEP).tolist()
-    # Heurística: si quedan < DEADLINE/2 tras tickers, recorta profundidad
-    elapsed = now()-t0
-    if elapsed > DEADLINE_S*0.25 and len(deep)>40:
-        deep = deep[:40]
-        log(f"[heuristic] lento al inicio; recorto profundidad a {len(deep)}")
-
-    # 2) Klines
-    log(f"[2/4] Klines 4h para {len(deep)} símbolos (limit={KLINES_LIMIT})…")
-    for i, sym in enumerate(deep, 1):
-        if now()-t0 > DEADLINE_S*0.75:  # deja margen para futuros y CSV
-            log(f"[cut] tiempo al {i-1}/{len(deep)}; corto klines")
-            break
-        dfk = fetch_klines_4h(sym, KLINES_LIMIT)
-        tr, p48 = compute_trend_and_48h(dfk)
-        if tr is not None: spot.loc[spot["symbol"]==sym,"Trend_4H"]=tr
-        if p48 is not None: spot.loc[spot["symbol"]==sym,"pct_change_48h"]=p48
-        if i%10==0: log(f"  klines {i}/{len(deep)}")
-
-    # 3) ScoreTrend
-    def score(tr, p24):
-        base = 0.0
-        if isinstance(p24,(int,float)) and not pd.isna(p24):
-            base = max(-0.10,min(0.10,p24))/0.10
-        if tr=="Alcista": base += 0.4
-        elif tr=="Bajista": base -= 0.4
-        return float(max(-1.0,min(1.0,base)))
-    spot["ScoreTrend"] = [score(tr,pc) for tr,pc in zip(spot.get("Trend_4H"), spot.get("pct_change_24h"))]
-
-    # 4) Futuros (funding/OI)
-    left = DEADLINE_S - (now()-t0)
-    # según tiempo restante, limita tamaño
-    max_fut = len(deep)
-    if left < 60: max_fut = min(25, max_fut)
-    elif left < 90: max_fut = min(35, max_fut)
-    deep_fut = deep[:max_fut]
-    log(f"[3/4] Futuros para {len(deep_fut)} símbolos…")
-    for i, sym in enumerate(deep_fut, 1):
-        if now()-t0 > DEADLINE_S*0.95:
-            log(f"[cut] quedando poco tiempo; corto futuros en {i-1}/{len(deep_fut)}")
-            break
-        fr = fetch_funding(sym)
-        oi = fetch_oi(sym)
-        if fr is not None: spot.loc[spot["symbol"]==sym,"fundingRate"]=fr
-        if oi is not None: spot.loc[spot["symbol"]==sym,"openInterest"]=oi
-        if i%10==0: log(f"  futures {i}/{len(deep_fut)}")
-
-    spot.sort_values("quote_volume_24h", ascending=False, inplace=True)
-    cols = ["symbol","price","pct_change_24h","pct_change_48h","quote_volume_24h","Trend_4H","ScoreTrend","fundingRate","openInterest"]
-    for c in cols:
-        if c not in spot.columns: spot[c]=np.nan
-    log(f"[4/4] Listo. filas={len(spot)}  t={now()-t0:,.1f}s")
-    return spot[cols].reset_index(drop=True)
-
-def run_screener():
-    df = build_df()
-    try:
-        df.to_csv(CSV_NAME, index=False)
-        log(f"[save] CSV -> {CSV_NAME}  rows={len(df)}")
-    except Exception as e:
-        log(f"[warn] no se pudo guardar CSV: {e}")
-
-   
-    #----
-    if __name__ == "__main__":
-    df = build_df()
-    # Enviar el DF al servidor por stdout (sin CSV)
-    try:
-        import json
-        print("__DFJSON__=" + df.to_json(orient="records"), flush=True)
-    except Exception as e:
-        # fallback opcional: si quisieras seguir guardando CSV en caso de error, descomenta:
-        # df.to_csv(os.getenv("SCREENER_CSV", "usdt_screener.csv"), index=False)
-        print(f"[warn] no se pudo emitir DFJSON: {e}", flush=True)
-
+    # IMPORTANTE: línea que detecta app.py
+    print("__DFJSON__=" + json.dumps(safe, ensure_ascii=False), flush=True)

@@ -1,291 +1,161 @@
-from flask import Flask, jsonify, request, Response, redirect, url_for
-import threading, time, uuid, json, os, subprocess
-import pandas as pd
+import os
+import json
+import threading
+import subprocess
+import time
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 app = Flask(__name__)
 
-JOBS = {}  # job_id -> {"status": "...", "df_json": str|None, "err": str|None, "log": list[str]}
+JOBS = {}  # job_id -> {"status": "...", "started": ts, "df_json": None, "log": []}
 
-CSV_NAME = os.getenv("SCREENER_CSV", "usdt_screener.csv")
-SCRIPT    = os.getenv("SCREENER_SCRIPT", "Binance_usdt_2.py")
-DFJSON_MARK = "__DFJSON__="  # marcador para recibir el DF por stdout
+HOME_HTML = """
+<!doctype html>
+<title>USDT Screener</title>
+<div style="font-family:system-ui, Segoe UI, Arial; max-width: 980px; margin: 32px auto;">
+  <h1>USDT Screener</h1>
+  <p>Render free tier: la primera petición puede tardar un poco en “despertar”.</p>
+  <form action="{{ url_for('start') }}" method="get">
+    <button style="padding:10px 16px; font-size:16px;">Run screener</button>
+  </form>
+</div>
+"""
+
+VIEW_HTML = """
+<!doctype html>
+<title>USDT Screener</title>
+<div style="font-family:system-ui, Segoe UI, Arial; max-width: 1100px; margin: 28px auto;">
+  <h2>Job {{ job_id }}</h2>
+  {% if status == "running" %}
+    <p><b>Status:</b> {{ status }} — Esta página se recarga cada 3s…</p>
+    <form action="" method="get"><button>Refresh</button></form>
+    <details style="margin-top:12px;"><summary>Ver JSON</summary><pre>{{ job_state|tojson(indent=2) }}</pre></details>
+    <script>setTimeout(()=>location.reload(), 3000);</script>
+  {% elif status == "done" %}
+    <p><b>Status:</b> {{ status }}</p>
+    <details style="margin-top:12px;"><summary>Ver JSON</summary><pre>{{ job_state|tojson(indent=2) }}</pre></details>
+    {% if df and (df|length) > 0 %}
+      <hr/>
+      <h3>Top 100</h3>
+      <table border="1" cellspacing="0" cellpadding="6">
+        <thead>
+          <tr>
+            <th>symbol</th><th>price</th><th>pct_change_24h</th>
+            <th>quote_volume_24h</th><th>Trend_4H</th><th>ScoreTrend</th>
+            <th>fundingRate</th><th>openInterest</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in df %}
+          <tr>
+            <td>{{ row.symbol }}</td>
+            <td>{{ "%.4f"|format(row.price|float) if row.price is not none else "" }}</td>
+            <td>{{ "%.4f%%"|format(row.pct_change_24h*100) if row.pct_change_24h is not none else "" }}</td>
+            <td>{{ "{:,.0f}".format(row.quote_volume_24h) if row.quote_volume_24h is not none else "" }}</td>
+            <td>{{ row.Trend_4H or "" }}</td>
+            <td>{{ "%.3f"|format(row.ScoreTrend) if row.ScoreTrend is not none else "" }}</td>
+            <td>{{ ("%.5f%%"|format(row.fundingRate*100)) if row.fundingRate is not none else "" }}</td>
+            <td>{{ "{:,.0f}".format(row.openInterest) if row.openInterest is not none else "" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No llegó DataFrame (o llegó vacío). Revisa el log debajo.</p>
+    {% endif %}
+    <hr/><h3>Log</h3>
+    <pre style="background:#111;color:#0f0;padding:12px; white-space:pre-wrap; max-height:320px; overflow:auto;">
+{{ log_txt }}
+    </pre>
+    <p><a href="{{ url_for('home') }}">Home</a></p>
+  {% else %}
+    <h3>Error</h3>
+    <pre style="background:#111;color:#f66;padding:12px;">{{ err_msg }}</pre>
+    <p><a href="{{ url_for('home') }}">Run again</a></p>
+  {% endif %}
+</div>
+"""
 
 def _append_log(job_id: str, line: str):
     if not line:
         return
-    # <= arregla IndexError; guardamos hasta 400 chars de caudal
+    # corte seguro a 400 chars como slice (NO índice)
     JOBS[job_id]["log"].append(line[-400:])
 
-def _run_pipeline_and_get_df(job_id: str) -> pd.DataFrame:
+def _run_pipeline_and_load_df(job_id: str, timeout_sec: int = 240):
     """
-    Lanza el script SIN timeout duro. Si el script imprime una línea
-    que empieza por '__DFJSON__=', tomamos ese JSON como DataFrame.
-    Si no, intentamos cargar el CSV si existe (fallback).
+    Ejecuta Binance_usdt_2.py y extrae el DataFrame desde stdout buscando la marca __DFJSON__=
     """
-    env = os.environ.copy()
-    env.setdefault("DEADLINE_S", "180")  # control del propio script
+    cmd = ["python", "Binance_usdt_2.py"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-    proc = subprocess.Popen(
-        ["python", SCRIPT],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        bufsize=1
-    )
+    df_json = None
+    try:
+        t0 = time.time()
+        for line in proc.stdout:
+            _append_log(job_id, line.strip())
+            if "__DFJSON__=" in line:
+                try:
+                    payload = line.split("__DFJSON__=", 1)[1].strip()
+                    df_json = json.loads(payload)
+                except Exception as e:
+                    _append_log(job_id, f"[parse-error] {repr(e)}")
+            if time.time() - t0 > timeout_sec:
+                proc.kill()
+                raise TimeoutError(f"TimeoutExpired({cmd}, {timeout_sec})")
+        rc = proc.wait(timeout=5)
+        if rc != 0:
+            _append_log(job_id, f"[exit-code] {rc}")
+    except Exception as e:
+        _append_log(job_id, f"[error] {repr(e)}")
 
-    df_json_line = None
-
-    # leer ambas tuberías de forma incremental
-    while True:
-        ret = proc.poll()
-
-        # stdout
-        if proc.stdout:
-            s = proc.stdout.readline()
-            if s:
-                s = s.rstrip("\n")
-                if s.startswith(DFJSON_MARK) and df_json_line is None:
-                    # capturamos el JSON de datos
-                    df_json_line = s[len(DFJSON_MARK):].strip()
-                else:
-                    _append_log(job_id, s)
-
-        # stderr
-        if proc.stderr:
-            e = proc.stderr.readline()
-            if e:
-                _append_log(job_id, e.rstrip("\n"))
-
-        if ret is not None:
-            break
-        time.sleep(0.02)
-
-    # 1) Si recibimos JSON por stdout, lo usamos (preferido)
-    if df_json_line:
-        try:
-            data = json.loads(df_json_line)
-            return pd.DataFrame(data)
-        except Exception as ex:
-            _append_log(job_id, f"[warn] DFJSON inválido: {ex!r}")
-
-    # 2) Fallback: intentar CSV si existe (para compatibilidad)
-    if os.path.exists(CSV_NAME):
-        try:
-            df = pd.read_csv(CSV_NAME)
-            try:
-                os.remove(CSV_NAME)
-            except Exception:
-                pass
-            return df
-        except Exception as ex:
-            _append_log(job_id, f"[warn] CSV inválido: {ex!r}")
-
-    # 3) Error si no hay ni JSON ni CSV
-    raise RuntimeError("No se recibió DF por stdout ni se generó CSV")
+    return df_json
 
 def _job_runner(job_id: str):
     JOBS[job_id]["status"] = "running"
     try:
-        df = _run_pipeline_and_get_df(job_id)
-
-        # Normalización suave de columnas esperadas
-        preferred = [
-            "symbol","price","pct_change_24h","pct_change_48h",
-            "quote_volume_24h","Trend_4H","ScoreAdj","ScoreTrend",
-            "fundingRate","openInterest"
-        ]
-        cols = [c for c in preferred if c in df.columns]
-        if cols:
-            df = df[cols].copy()
-
-        for c in ("price","pct_change_24h","pct_change_48h","quote_volume_24h",
-                  "fundingRate","openInterest","ScoreAdj","ScoreTrend"):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        if len(df) > 500:
-            df = df.head(500)
-
-        JOBS[job_id]["df_json"] = df.to_json(orient="records")
+        df = _run_pipeline_and_load_df(job_id)
+        JOBS[job_id]["df_json"] = df or []
         JOBS[job_id]["status"] = "done"
-        _append_log(job_id, f"[ok] filas={len(df)}")
     except Exception as e:
+        _append_log(job_id, f"[error-final] {repr(e)}")
         JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["err"] = repr(e)
-        _append_log(job_id, f"[error] {repr(e)}")
 
-def _html_wrapper(body: str, title="USDT Screener"):
-    return f"""<!doctype html><html><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;background:#fafafa;color:#111}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}}
-.card{{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}}
-.btn{{display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid #e5e7eb;text-decoration:none;background:#fff}}
-.muted{{color:#6b7280}}
-table{{width:100%;border-collapse:collapse;font-size:14px}}
-th,td{{padding:8px;border-bottom:1px solid #eee;text-align:right}}
-th:first-child,td:first-child{{text-align:left}}
-.badge{{display:inline-block;padding:.25rem .5rem;border-radius:999px;font-size:12px;border:1px solid #e5e7eb;background:#fff}}
-.header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}}
-pre{{white-space:pre-wrap;max-height:220px;overflow:auto;background:#0b1220;color:#d1e0ff;padding:10px;border-radius:10px}}
-</style>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-</head><body>
-{body}
-</body></html>"""
-
-def _render_dashboard(df: pd.DataFrame) -> str:
-    import plotly.express as px
-    has_pct = "pct_change_24h" in df.columns
-    has_vol = "quote_volume_24h" in df.columns
-    has_trend = "Trend_4H" in df.columns
-    has_score = "ScoreTrend" in df.columns
-    has_oi = "openInterest" in df.columns
-    has_fund = "fundingRate" in df.columns
-
-    total = len(df)
-
-    if has_pct:
-        movers = df.dropna(subset=["pct_change_24h"]).copy()
-        movers["abs_move"] = movers["pct_change_24h"].abs()
-        movers = movers.sort_values("abs_move", ascending=False).head(20)
-        fig1 = px.bar(movers, x="symbol", y="pct_change_24h", title="Top 20 Movers (24h %)")
-        fig1.update_layout(margin=dict(l=20,r=20,t=40,b=20), height=360)
-        movers_div = fig1.to_html(full_html=False, include_plotlyjs=False)
-    else:
-        movers_div = "<div class='muted'>No pct_change_24h</div>"
-
-    if has_vol:
-        vol = df.dropna(subset=["quote_volume_24h"]).sort_values("quote_volume_24h", ascending=False).head(20)
-        fig2 = pd.DataFrame(vol)
-        import plotly.express as px
-        fig2 = px.bar(vol, x="symbol", y="quote_volume_24h", title="Top 20 by 24h Quote Volume (USDT)")
-        fig2.update_layout(margin=dict(l=20,r=20,t=40,b=20), height=360)
-        vol_div = fig2.to_html(full_html=False, include_plotlyjs=False)
-    else:
-        vol_div = "<div class='muted'>No quote_volume_24h</div>"
-
-    if has_fund and has_oi:
-        fd = df.dropna(subset=["fundingRate","openInterest"]).copy()
-        fd = fd.sort_values("openInterest", ascending=False).head(60)
-        fig3 = px.scatter(fd, x="fundingRate", y="openInterest", color="fundingRate",
-                          hover_name="symbol", size=("ScoreTrend" if has_score else None),
-                          title="Funding Rate vs Open Interest (top by OI)")
-        fig3.update_layout(margin=dict(l=20,r=20,t=40,b=20), height=400)
-        fdo_div = fig3.to_html(full_html=False, include_plotlyjs=False)
-    else:
-        fdo_div = "<div class='muted'>Funding/OI not available</div>"
-
-    table_cols = [c for c in ["symbol","price","pct_change_24h","pct_change_48h","quote_volume_24h","Trend_4H","ScoreTrend","fundingRate","openInterest"] if c in df.columns]
-    if "quote_volume_24h" in table_cols:
-        table_df = df.sort_values("quote_volume_24h", ascending=False).head(100)[table_cols]
-    else:
-        table_df = df.head(100)[table_cols]
-
-    def fmt_num(v, pct=False):
-        if pd.isna(v): return "—"
-        try: return f"{v:,.4%}" if pct else f"{v:,.4f}"
-        except Exception: return str(v)
-
-    rows = ["<table><thead><tr>" + "".join(f"<th>{h}</th>" for h in table_df.columns) + "</tr></thead><tbody>"]
-    for _, r in table_df.iterrows():
-        tds = []
-        for c in table_df.columns:
-            if c.startswith("pct_") or c in ("fundingRate",):
-                tds.append(f"<td>{fmt_num(r[c], pct=True)}</td>")
-            elif c in ("price","quote_volume_24h","openInterest","ScoreTrend"):
-                tds.append(f"<td>{fmt_num(r[c])}</td>")
-            else:
-                tds.append(f"<td>{r[c]}</td>")
-        rows.append("<tr>" + "".join(tds) + "</tr>")
-    rows.append("</tbody></table>")
-    table_html = "\n".join(rows)
-
-    body = f"""
-    <div class="header">
-      <h1>USDT Screener</h1>
-      <div>
-        <a class="btn" href="/" title="Home">Home</a>
-        <a class="btn" href="/start" title="Run again">Run again</a>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <div class="header"><h3>Resumen</h3><span class="badge">{total} símbolos</span></div>
-        <div class="muted">4H Trend breakdown visible en tabla.</div>
-      </div>
-      <div class="card">{movers_div}</div>
-      <div class="card">{vol_div}</div>
-      <div class="card">{fdo_div}</div>
-    </div>
-
-    <div class="card" style="margin-top:16px">
-      <div class="header"><h3>Top 100</h3><span class="muted">sorted by 24h volume (if available)</span></div>
-      {table_html}
-    </div>
-    """
-    return _html_wrapper(body, "USDT Screener")
-
-@app.get("/")
+@app.route("/")
 def home():
-    body = f"""
-    <div class="header">
-      <h1>USDT Screener</h1>
-      <a class="btn" href="/start">Run screener</a>
-    </div>
-    <div class="card"><h3>Endpoints</h3>
-      <ul>
-        <li><code>/start</code> – lanza ejecución en background</li>
-        <li><code>/status?job=&lt;id&gt;</code> – estado + log</li>
-        <li><code>/view?job=&lt;id&gt;</code> – dashboard HTML</li>
-      </ul>
-    </div>
-    """
-    return Response(_html_wrapper(body, "Service Ready"), mimetype="text/html")
+    return render_template_string(HOME_HTML)
 
-@app.get("/start")
+@app.route("/start")
 def start():
-    job = uuid.uuid4().hex[:12]
-    JOBS[job] = {"status": "queued", "df_json": None, "err": None, "log": []}
-    t = threading.Thread(target=_job_runner, args=(job,), daemon=True)
+    job_id = f"{int(time.time()*1000):x}"[-12:]
+    JOBS[job_id] = {"status": "queued", "started": time.time(), "df_json": None, "log": []}
+    t = threading.Thread(target=_job_runner, args=(job_id,), daemon=True)
     t.start()
-    return redirect(url_for('view', job=job), code=302)
+    return redirect(url_for("view", job=job_id), code=302)
 
-@app.get("/status")
+@app.route("/status")
 def status():
-    job = request.args.get("job")
-    if not job or job not in JOBS:
-        return jsonify({"error": "invalid job id"}), 400
-    info = JOBS[job].copy()
-    if info.get("df_json"):
-        info["rows"] = len(json.loads(info["df_json"]))
-    return jsonify({"job": job, **info})
+    job_id = request.args.get("job", "")
+    return jsonify({**JOBS.get(job_id, {}), "job": job_id})
 
-@app.get("/view")
+@app.route("/view")
 def view():
-    job = request.args.get("job")
-    if not job or job not in JOBS:
-        return jsonify({"error": "invalid job id"}), 400
-    info = JOBS[job]
-    st = info["status"]
-    if st == "error":
-        log_html = "<br>".join(info.get("log", [])[-80:])
-        return Response(_html_wrapper(f"<div class='card'><h3>Error</h3><pre>{log_html or info.get('err')}</pre><a class='btn' href='/start'>Run again</a></div>","Error"), mimetype="text/html")
-    if st != "done":
-        log_html = "<br>".join(info.get("log", [])[-80:])
-        body = f"""
-        <div class="card">
-          <p>Job <b>{job}</b> status: <span class="badge">{st}</span></p>
-          <p class="muted">Esta página se recarga cada 3s…</p>
-          <meta http-equiv="refresh" content="3" />
-          <a class="btn" href="/status?job={job}" target="_blank">Ver JSON</a>
-          <pre>{log_html}</pre>
-        </div>
-        """
-        return Response(_html_wrapper(body, "Working…"), mimetype="text/html")
-    df = pd.DataFrame(json.loads(info["df_json"]))
-    return Response(_render_dashboard(df), mimetype="text/html")
+    job_id = request.args.get("job", "")
+    state = JOBS.get(job_id)
+    if not state:
+        return render_template_string(VIEW_HTML, job_id=job_id, status="error", err_msg="Job no encontrado", job_state={}, log_txt="")
+    log_txt = "\n".join(state.get("log", []))
+    df = state.get("df_json") or []
+    return render_template_string(
+        VIEW_HTML,
+        job_id=job_id,
+        status=state.get("status"),
+        job_state={**state, "job": job_id},
+        df=df,
+        log_txt=log_txt,
+        err_msg="",
+    )
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
