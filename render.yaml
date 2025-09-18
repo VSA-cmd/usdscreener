@@ -2,7 +2,7 @@ services:
   - type: web
     name: usdscreener
     runtime: python
-    region: frankfurt          # o "singapore"
+    region: singapore          # o "frankfurt"
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --timeout 300 --workers 1 --threads 4
