@@ -1,11 +1,11 @@
-services:
+ervices:
   - type: web
     name: usdscreener
     runtime: python
-    region: singapore          # o "frankfurt"
+    region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 300 --workers 1 --threads 4
+    startCommand: gunicorn app:app --timeout 600 --workers 1 --threads 4
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
