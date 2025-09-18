@@ -4,3 +4,4 @@ requests
 pandas
 numpy
 python-decouple
+plotly
