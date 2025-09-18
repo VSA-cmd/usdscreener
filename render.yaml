@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: usdt-screener
+    runtime: python
+    region: frankfurt     # o "singapore" si prefieres
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
