@@ -2,7 +2,8 @@ import os
 import sys
 import time
 import json
-from typing import List, Dict, Any, Optional
+import math
+from typing import List, Dict, Any, Optional, Set
 
 import requests
 import pandas as pd
@@ -18,7 +19,6 @@ if FORCE_GLOBAL or BINANCE_REGION not in {"US"}:
     SPOT_BASE = "https://api.binance.com"
     FUTU_BASE = "https://fapi.binance.com"  # futures (USDT-m)
 else:
-    # Región USA (spot). Futures no expuestos igual que global; omitir métricas futures si no hay FORCE_GLOBAL
     SPOT_BASE = "https://api.binance.us"
     FUTU_BASE = None  # deshabilitado en modo US
 
@@ -32,17 +32,38 @@ def _get(url: str, params: Dict[str, Any] = None, timeout: int = 12) -> Optional
         r.raise_for_status()
         return r.json()
     except Exception as e:
+        # Mandamos a stderr; app redirige stderr->stdout para el log
         print(f"[warn] GET failed {url} -> {repr(e)}", file=sys.stderr, flush=True)
         return None
+
+
+# -------------------------------
+# Descubrir qué símbolos tienen futuros
+# -------------------------------
+def fetch_futures_symbols() -> Set[str]:
+    if not FUTU_BASE:
+        return set()
+    info = _get(f"{FUTU_BASE}/fapi/v1/exchangeInfo")
+    symbols = set()
+    if info and isinstance(info, dict):
+        for s in info.get("symbols", []):
+            try:
+                if s.get("status") == "TRADING":
+                    symbols.add(str(s.get("symbol")))
+            except Exception:
+                pass
+    return symbols
+
+
+FUT_SYMBOLS = fetch_futures_symbols()
 
 
 # -------------------------------
 # Data builders
 # -------------------------------
 def fetch_24h_tickers_usdt(limit_symbols: int = 20) -> List[Dict[str, Any]]:
-    """Trae todos los tickers 24h y filtra los que terminan en USDT; devuelve top por quoteVolume."""
-    url = f"{SPOT_BASE}/api/v3/ticker/24hr"
-    data = _get(url) or []
+    """Trae tickers 24h y filtra los que terminan en USDT; devuelve top por quoteVolume."""
+    data = _get(f"{SPOT_BASE}/api/v3/ticker/24hr") or []
     rows = []
     for d in data:
         sym = d.get("symbol", "")
@@ -56,16 +77,13 @@ def fetch_24h_tickers_usdt(limit_symbols: int = 20) -> List[Dict[str, Any]]:
                 "quote_volume_24h": float(d.get("quoteVolume") or 0.0),
             })
         except Exception:
-            # si hay campos corruptos, ignora esa fila
             continue
-    # ordenar por volumen desc y limitar
     rows.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
     return rows[:limit_symbols] if rows else []
 
 
 def fetch_klines_close(symbol: str, interval: str = "4h", limit: int = 30) -> List[float]:
-    url = f"{SPOT_BASE}/api/v3/klines"
-    data = _get(url, {"symbol": symbol, "interval": interval, "limit": limit})
+    data = _get(f"{SPOT_BASE}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     closes = []
     if isinstance(data, list):
         for item in data:
@@ -88,10 +106,9 @@ def compute_trend_4h(closes: List[float]) -> Dict[str, Any]:
 
 
 def fetch_funding_rate(symbol: str) -> Optional[float]:
-    if not FUTU_BASE:
+    if not FUTU_BASE or symbol not in FUT_SYMBOLS:
         return None
-    url = f"{FUTU_BASE}/fapi/v1/fundingRate"
-    data = _get(url, {"symbol": symbol, "limit": 1})
+    data = _get(f"{FUTU_BASE}/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1})
     try:
         if isinstance(data, list) and data:
             return float(data[0].get("fundingRate") or 0.0)
@@ -101,10 +118,9 @@ def fetch_funding_rate(symbol: str) -> Optional[float]:
 
 
 def fetch_open_interest(symbol: str) -> Optional[float]:
-    if not FUTU_BASE:
+    if not FUTU_BASE or symbol not in FUT_SYMBOLS:
         return None
-    url = f"{FUTU_BASE}/fapi/v1/openInterest"
-    data = _get(url, {"symbol": symbol})
+    data = _get(f"{FUTU_BASE}/fapi/v1/openInterest", {"symbol": symbol})
     try:
         if isinstance(data, dict) and "openInterest" in data:
             return float(data["openInterest"])
@@ -114,10 +130,8 @@ def fetch_open_interest(symbol: str) -> Optional[float]:
 
 
 def build_df(limit_symbols: int = 20) -> pd.DataFrame:
-    # 1) Top por volumen USDT (spot)
     tickers = fetch_24h_tickers_usdt(limit_symbols=limit_symbols)
     if not tickers:
-        # fallback muy pequeño para que nunca explote: BTC y ETH si todo falla
         tickers = [
             {"symbol": "BTCUSDT", "price": None, "pct_change_24h": None, "quote_volume_24h": None},
             {"symbol": "ETHUSDT", "price": None, "pct_change_24h": None, "quote_volume_24h": None},
@@ -126,14 +140,10 @@ def build_df(limit_symbols: int = 20) -> pd.DataFrame:
     out_rows = []
     for t in tickers:
         sym = t["symbol"]
-        # 2) Trend 4H
         closes = fetch_klines_close(sym, "4h", 30)
         trend = compute_trend_4h(closes)
-
-        # 3) Futures metrics (si aplica)
         fr = fetch_funding_rate(sym)
         oi = fetch_open_interest(sym)
-
         out_rows.append({
             "symbol": sym,
             "price": t.get("price"),
@@ -144,15 +154,22 @@ def build_df(limit_symbols: int = 20) -> pd.DataFrame:
             "fundingRate": fr,
             "openInterest": oi,
         })
-
-        # pequeña pausa para no golpear límites si hay muchas llamadas
-        time.sleep(0.05)
+        time.sleep(0.05)  # rate-limit suave
 
     df = pd.DataFrame(out_rows)
-    # Orden por volumen si existe
     if "quote_volume_24h" in df.columns:
         df = df.sort_values("quote_volume_24h", ascending=False, na_position="last").reset_index(drop=True)
     return df
+
+
+def _to_float_or_none(x):
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
 
 
 # -------------------------------
@@ -160,32 +177,23 @@ def build_df(limit_symbols: int = 20) -> pd.DataFrame:
 # -------------------------------
 if __name__ == "__main__":
     try:
-        # puedes ajustar el límite por env si quieres: LIMIT_SYMBOLS=20
         limit = int(os.environ.get("LIMIT_SYMBOLS", "20"))
     except Exception:
         limit = 20
 
     df = build_df(limit_symbols=limit)
 
-    # Asegurar tipos serializables
-    def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-
     safe = []
     for _, r in df.iterrows():
         safe.append({
             "symbol": r.get("symbol"),
-            "price": _to_float(r.get("price")),
-            "pct_change_24h": _to_float(r.get("pct_change_24h")),
-            "quote_volume_24h": _to_float(r.get("quote_volume_24h")),
+            "price": _to_float_or_none(r.get("price")),
+            "pct_change_24h": _to_float_or_none(r.get("pct_change_24h")),
+            "quote_volume_24h": _to_float_or_none(r.get("quote_volume_24h")),
             "Trend_4H": r.get("Trend_4H"),
-            "ScoreTrend": _to_float(r.get("ScoreTrend")),
-            "fundingRate": _to_float(r.get("fundingRate")),
-            "openInterest": _to_float(r.get("openInterest")),
+            "ScoreTrend": _to_float_or_none(r.get("ScoreTrend")),
+            "fundingRate": _to_float_or_none(r.get("fundingRate")),
+            "openInterest": _to_float_or_none(r.get("openInterest")),
         })
 
-    # IMPORTANTE: línea que detecta app.py
     print("__DFJSON__=" + json.dumps(safe, ensure_ascii=False), flush=True)

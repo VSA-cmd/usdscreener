@@ -14,7 +14,7 @@ HOME_HTML = """
 <title>USDT Screener</title>
 <div style="font-family:system-ui, Segoe UI, Arial; max-width: 980px; margin: 32px auto;">
   <h1>USDT Screener</h1>
-  <p>Render free tier: la primera petición puede tardar un poco en “despertar”.</p>
+  <p>Free tier: la primera petición puede tardar un poco en “despertar”.</p>
   <form action="{{ url_for('start') }}" method="get">
     <button style="padding:10px 16px; font-size:16px;">Run screener</button>
   </form>
@@ -79,7 +79,7 @@ VIEW_HTML = """
 def _append_log(job_id: str, line: str):
     if not line:
         return
-    # corte seguro a 400 chars como slice (NO índice)
+    # corte seguro a 400 chars como slice
     JOBS[job_id]["log"].append(line[-400:])
 
 def _run_pipeline_and_load_df(job_id: str, timeout_sec: int = 240):
@@ -93,7 +93,7 @@ def _run_pipeline_and_load_df(job_id: str, timeout_sec: int = 240):
     try:
         t0 = time.time()
         for line in proc.stdout:
-            _append_log(job_id, line.strip())
+            _append_log(job_id, line.rstrip("\n"))
             if "__DFJSON__=" in line:
                 try:
                     payload = line.split("__DFJSON__=", 1)[1].strip()
