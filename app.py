@@ -1,192 +1,187 @@
 # -*- coding: utf-8 -*-
+import io
 import os
+import json
 import uuid
+import threading
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, request, jsonify, redirect, url_for, render_template_string, Response, send_file
-import io 
 import pandas as pd
+from flask import Flask, request, Response, send_file, render_template_string, redirect, url_for
 
-import Binance_usdt_2 as engine
-from pathlib import Path
+# ---- importa el motor ligero para Render ----
+import Binance_usdt_2 as engine  # asegúrate que el nombre del archivo coincide
 
-@app.get("/csv_tmp")
-def csv_tmp():
-    p = Path("/tmp/usdt_screener.csv")
-    if not p.exists():
-        return "El archivo /tmp/usdt_screener.csv no existe", 404
-    return send_file(
-        str(p),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="usdt_screener.csv"
-    )
-
-
+# ===================== Flask app =====================
 app = Flask(__name__)
-executor = ThreadPoolExecutor(max_workers=2)
-JOBS = {}  # job_id -> dict(status, started, ended, raw_rows(list[dict]), log(str))
 
-HTML = """
+# Memoria en proceso para jobs efímeros
+JOBS = {}  # job_id -> dict(status, started, ended, rows, raw_rows, info)
+
+# Parámetros de presentación
+TOP_N = int(os.environ.get("TOP_N", "100"))
+
+# ===================== Helpers =====================
+def _now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _rows_from_df(df: pd.DataFrame, top_n: int) -> list[dict]:
+    """Devuelve filas simples (tipos JSON-friendly)."""
+    cols_pref = [
+        "symbol", "price", "pct_change_24h", "quote_volume_24h",
+        "Trend_4H", "ScoreTrend", "fundingRate", "openInterest",
+        "oi_delta", "NetScore", "GHI"
+    ]
+    cols = [c for c in cols_pref if c in df.columns]
+    slim = df[cols].head(top_n).copy()
+    # convierte NaN -> None para JSON limpio
+    out = []
+    for _, r in slim.iterrows():
+        d = {k: (None if pd.isna(v) else (float(v) if isinstance(v, (int, float)) else v)) for k, v in r.to_dict().items()}
+        out.append(d)
+    return out
+
+
+def _start_job(job_id: str):
+    """Hilo que ejecuta el cálculo y guarda resultados en JOBS."""
+    try:
+        df, info = engine.build_df()  # respeta LIMIT_SYMBOLS/MAX_WORKERS/BUDGET desde ENV
+        rows = _rows_from_df(df, TOP_N) if df is not None and not df.empty else []
+        JOBS[job_id].update({
+            "status": "done",
+            "ended": _now_utc_str(),
+            "rows": rows,
+            "raw_rows": rows,   # mantenemos las mismas filas para CSV estable
+            "info": info or {},
+        })
+    except Exception as e:
+        JOBS[job_id].update({
+            "status": "error",
+            "ended": _now_utc_str(),
+            "error": str(e),
+        })
+
+
+# ===================== Rutas =====================
+
+@app.get("/")
+def home():
+    """Lanza un job y redirige a la vista con auto-refresh."""
+    job_id = uuid.uuid4().hex[:10]
+    JOBS[job_id] = {"status": "running", "started": _now_utc_str()}
+    t = threading.Thread(target=_start_job, args=(job_id,), daemon=True)
+    t.start()
+    return redirect(url_for("view_job", job=job_id))
+
+
+@app.get("/view")
+def view_job():
+    """HTML simple con auto-refresh; muestra tabla cuando termina."""
+    job = request.args.get("job")
+    j = JOBS.get(job)
+    if not j:
+        return "Job not found", 404
+
+    # Pequeña plantilla inline para evitar archivos estáticos
+    tpl = """
 <!doctype html>
-<html lang="es">
+<html>
 <head>
-  <meta charset="utf-8">
-  <title>{{ title }}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8"/>
+  <title>Job {{ job }}</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:18px;color:#111}
-    table{border-collapse:collapse;width:100%;font-size:14px}
-    th,td{border:1px solid #ddd;padding:6px 8px;text-align:right;white-space:nowrap}
-    th{background:#f6f6f6;position:sticky;top:0}
-    td:first-child,th:first-child{text-align:left}
-    .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
-    .ok{background:#e8fff0;color:#126f3d}
-    .warn{background:#fff6e0;color:#7a6200}
-    .err{background:#ffefef;color:#9c1a1a}
-    .muted{color:#777}
-    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px}
-    .toolbar{margin-bottom:10px}
-    .spinner{display:inline-block;width:12px;height:12px;border:2px solid #ccc;border-top-color:#333;border-radius:50%;animation:spin 0.9s linear infinite;margin-right:6px}
-    @keyframes spin{to{transform:rotate(360deg)}}
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: right; }
+    th { background: #f5f5f5; }
+    td:first-child, th:first-child { text-align: left; }
+    .muted { color: #777; }
   </style>
 </head>
 <body>
-  <h2>{{ title }}</h2>
-
-  <div class="toolbar">
-    Job <span class="mono">{{ job }}</span> ·
-    Estado: <span id="status" class="tag warn">running</span>
-    · Inicio: <span id="started">{{ started }}</span>
+  <h3>Job {{ job }}</h3>
+  <p>
+    Estado: <b>{{ j["status"] }}</b>
+    {% if j.get("started") %} · inicio: {{ j["started"] }} {% endif %}
+    {% if j.get("ended") %} · fin: {{ j["ended"] }} {% endif %}
     · <a id="jsonlink" href="{{ url_for('job_json', job=job) }}" target="_blank">Ver JSON</a>
     · <a id="csvlink" href="{{ url_for('job_csv', job=job) }}" target="_blank">Descargar CSV</a>
-  </div>
+  </p>
 
-  <div id="hint" class="muted"><span class="spinner"></span>Calculando… esta página se actualizará automáticamente.</div>
-
-  <h3 id="titleTop" style="display:none">Top</h3>
-  <div id="tableWrap"></div>
-
-  <h3>Log</h3>
-  <pre id="log" class="mono">{{ log or '' }}</pre>
-
-<script>
-const jobId = "{{ job }}";
-const apiUrl = "{{ url_for('job_json', job=job) }}";
-const statusEl = document.getElementById('status');
-const hintEl = document.getElementById('hint');
-const tableWrap = document.getElementById('tableWrap');
-const titleTop = document.getElementById('titleTop');
-const logEl = document.getElementById('log');
-
-function fmtNum(n, digits){ if(n===null||n===undefined||isNaN(n)) return "-"; return Number(n).toFixed(digits); }
-function fmtPct(n, digits){ if(n===null||n===undefined||isNaN(n)) return "-"; return (Number(n)*100).toFixed(digits)+"%"; }
-function fmtInt(n){ if(n===null||n===undefined||isNaN(n)) return "-"; return Number(n).toLocaleString(); }
-
-function render(rows){
-  const cols = ["symbol","price","pct_change_24h","quote_volume_24h","Trend_4H","ScoreTrend","fundingRate","openInterest","oi_delta","NetScore","GHI"];
-  let thead = "<thead><tr>" + cols.map(c=>`<th>${c}</th>`).join("") + "</tr></thead>";
-  let body = rows.map(r=>{
-    return "<tr>"
-      + `<td>${r.symbol}</td>`
-      + `<td>${fmtNum(r.price, 8)}</td>`
-      + `<td>${fmtPct(r.pct_change_24h, 3)}</td>`
-      + `<td>${fmtInt(r.quote_volume_24h)}</td>`
-      + `<td>${r.Trend_4H||"-"}</td>`
-      + `<td>${fmtNum(r.ScoreTrend, 3)}</td>`
-      + `<td>${r.fundingRate===null||r.fundingRate===undefined||isNaN(r.fundingRate)?"-":(Number(r.fundingRate)*100).toFixed(4)+"%"}</td>`
-      + `<td>${fmtInt(r.openInterest)}</td>`
-      + `<td>${fmtInt(r.oi_delta)}</td>`
-      + `<td>${r.NetScore===null||r.NetScore===undefined?"-":(Number(r.NetScore).toFixed(2))}</td>`
-      + `<td>${fmtNum(r.GHI, 3)}</td>`
-      + "</tr>";
-  }).join("");
-  tableWrap.innerHTML = `<table>${thead}<tbody>${body}</tbody></table>`;
-  titleTop.style.display = "";
-  titleTop.textContent = "Top " + rows.length;
-}
-
-async function poll(){
-  try{
-    const r = await fetch(apiUrl, {cache:"no-store"});
-    if(r.status === 404){
-      statusEl.className = "tag err";
-      statusEl.textContent = "not found";
-      hintEl.textContent = "Este job ya no existe (posible redeploy o expiración). Lanza uno nuevo con /";
-      return;
-    }
-    const j = await r.json();
-    if(j.status !== "done"){
-      statusEl.className = "tag warn";
-      statusEl.textContent = j.status || "running";
-      setTimeout(poll, 2000);
-      return;
-    }
-    statusEl.className = "tag ok";
-    statusEl.textContent = "done";
-    hintEl.style.display = "none";
-    render(j.rows || []);
-  }catch(e){
-    statusEl.className = "tag err";
-    statusEl.textContent = "error";
-    hintEl.textContent = "Error consultando el API del job. Reintenta.";
-  }
-}
-poll();
-</script>
+  {% if j["status"] != "done" %}
+    <p class="muted">Actualiza en unos segundos…</p>
+    <script>
+      setTimeout(function(){ location.reload(); }, 4000);
+    </script>
+  {% elif j.get("error") %}
+    <pre>{{ j["error"] }}</pre>
+  {% else %}
+    <h4>Top {{ rows|length }}</h4>
+    <table>
+      <thead>
+        <tr>
+          <th>symbol</th>
+          <th>price</th>
+          <th>% 24h</th>
+          <th>quote volume 24h</th>
+          <th>Trend 4H</th>
+          <th>ScoreTrend</th>
+          <th>fundingRate</th>
+          <th>openInterest</th>
+          <th>oi_delta</th>
+          <th>NetScore</th>
+          <th>GHI</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td style="text-align:left">{{ r.get("symbol","") }}</td>
+          <td>{{ "%.6g"|format(r.get("price") or 0) }}</td>
+          <td>{{ "%.3f"|format(100*(r.get("pct_change_24h") or 0)) }}%</td>
+          <td>{{ "{:,.0f}".format(r.get("quote_volume_24h") or 0) }}</td>
+          <td>{{ r.get("Trend_4H") or "-" }}</td>
+          <td>{{ "%.3f"|format(r.get("ScoreTrend") or 0) }}</td>
+          <td>{{ ("%.6f"%r.get("fundingRate")).rstrip('0').rstrip('.') if r.get("fundingRate") is not none else "-" }}</td>
+          <td>{{ "{:,.0f}".format(r.get("openInterest") or 0) if r.get("openInterest") is not none else "-" }}</td>
+          <td>{{ "{:,.0f}".format(r.get("oi_delta") or 0) if r.get("oi_delta") is not none else "-" }}</td>
+          <td>{{ "%.2f"|format(r.get("NetScore") or 0) }}</td>
+          <td>{{ "%.3f"|format(r.get("GHI") or 0) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
 </body>
 </html>
-"""
+    """
+    rows = j.get("rows") or []
+    return render_template_string(tpl, job=job, j=j, rows=rows)
 
-def run_job(job_id: str, limit: int):
-    logs = []
-    def logp(msg):
-        print(msg)
-        logs.append(str(msg))
-
-    try:
-        JOBS[job_id] = {"status":"running","started":datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "ended":None,"raw_rows":None,"log":None}
-        df, info = engine.build_df(limit_symbols=limit, logger=logp)
-        rows = df.to_dict(orient="records")
-        JOBS[job_id]["raw_rows"] = rows
-        JOBS[job_id]["status"] = "done"
-        JOBS[job_id]["ended"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        JOBS[job_id]["log"] = "\n".join(logs + [str(info)])
-    except Exception as e:
-        JOBS[job_id]["status"] = f"error: {e}"
-        JOBS[job_id]["ended"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        JOBS[job_id]["log"] = "\n".join(logs) + f"\nERROR: {e}"
-
-@app.get("/")
-def index():
-    limit = int(request.args.get("limit") or os.environ.get("LIMIT_SYMBOLS", "150"))
-    job = uuid.uuid4().hex[:10]
-    # arranca en background
-    executor.submit(run_job, job, limit)
-    return redirect(url_for("view", job=job))
-
-@app.get("/view")
-def view():
-    job = request.args.get("job")
-    j = JOBS.get(job)
-    # si aún no existe (arrancando), crea stub para que el HTML pueda “pullear”
-    if not j:
-        JOBS[job] = {"status":"running","started":datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                     "ended":None,"raw_rows":None,"log":None}
-        j = JOBS[job]
-    return render_template_string(
-        HTML,
-        title=f"Job {job}",
-        job=job,
-        started=j.get("started"),
-        log=j.get("log"),
-    )
 
 @app.get("/api")
+def job_json():
+    """Devuelve el resultado del job en JSON."""
+    job = request.args.get("job")
+    j = JOBS.get(job)
+    if not j:
+        return Response(json.dumps({"status": "not_found"}), status=404, mimetype="application/json")
+    payload = {
+        "job": job,
+        "status": j.get("status"),
+        "started": j.get("started"),
+        "ended": j.get("ended"),
+        "rows": j.get("rows") or [],
+        "info": j.get("info") or {},
+        "error": j.get("error"),
+    }
+    return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
+
+
 @app.get("/csv")
 def job_csv():
+    """Genera un CSV directamente desde el resultado del job (estable)."""
     job = request.args.get("job")
     j = JOBS.get(job)
     if not j:
@@ -199,7 +194,6 @@ def job_csv():
         return "No data", 204
 
     df = pd.DataFrame(rows)
-    # Orden “web-friendly” (ajústalo si quieres)
     cols = ["symbol","price","pct_change_24h","quote_volume_24h",
             "Trend_4H","ScoreTrend","fundingRate","openInterest",
             "oi_delta","NetScore","GHI"]
@@ -209,27 +203,35 @@ def job_csv():
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     csv_bytes = buf.getvalue().encode("utf-8")
-
     return Response(
         csv_bytes,
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename=usdt_screener_{job}.csv"}
     )
 
-def job_json():
-    job = request.args.get("job")
-    j = JOBS.get(job)
-    if not j:
-        return jsonify({"error":"job not found"}), 404
-    if j["status"] != "done":
-        return jsonify({"job":job, "status":j["status"], "started": j.get("started")})
-    return jsonify({
-        "job": job,
-        "status": "done",
-        "started": j.get("started"),
-        "ended": j.get("ended"),
-        "rows": j.get("raw_rows") or [],
-    })
 
+@app.get("/csv_tmp")
+def csv_tmp():
+    """Sirve el archivo temporal /tmp/usdt_screener.csv si existe."""
+    from pathlib import Path
+    p = Path("/tmp/usdt_screener.csv")
+    if not p.exists():
+        return "El archivo /tmp/usdt_screener.csv no existe", 404
+    return send_file(
+        str(p),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="usdt_screener.csv",
+    )
+
+
+# Salud
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+
+# ============== main (local) ==============
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8000")), debug=False)
+    # Para probar local: FLASK_DEBUG=1 python app.py
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)
