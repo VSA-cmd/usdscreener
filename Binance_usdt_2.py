@@ -1,132 +1,80 @@
+# engines/binance_usdt_2.py
 """
-Motor sencillo para generar /tmp/usdt_screener.csv con los pares *USDT
-de Binance ordenados por liquidez (quoteVolume).
+Motor: Binance_usdt_2
 
-Requiere: requests, pandas (ya están en requirements.txt).
+- Toma el ticker 24h de Binance.
+- Filtra pares que terminan en USDT y están en estado TRADING.
+- Ordena el resultado por priceChangePercent (descendente).
+- Limita por LIMIT_SYMBOLS.
+- Devuelve un dict con: rows, count, elapsed_sec, etc.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import time
-from typing import List, Dict, Any
-from pathlib import Path
+from typing import Any, Dict, List
 
 import requests
-import pandas as pd
 
 
-BINANCE_BASE = "https://api.binance.com"
-CSV_PATH = Path("/tmp/usdt_screener.csv")
+BINANCE_API = "https://api.binance.com"
 
 
-def _get_json(url: str, params: Dict[str, Any] | None = None, timeout: int = 20) -> Any:
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def _get_trading_usdt_symbols() -> List[str]:
+    """Lista de símbolos USDT con estado TRADING."""
+    info = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=30).json()
+    syms = []
+    for s in info.get("symbols", []):
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+            syms.append(s["symbol"])
+    return syms
 
 
-def fetch_trading_usdt_symbols() -> List[str]:
-    info = _get_json(f"{BINANCE_BASE}/api/v3/exchangeInfo")
-    symbols = info.get("symbols", [])
-    usdt = [s["symbol"] for s in symbols if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"]
-    return usdt
+def run(params: Dict[str, Any]) -> Dict[str, Any]:
+    t0 = time.time()
+    limit = int(params.get("LIMIT_SYMBOLS", 150))
 
+    # 1) Símbolos USDT/TRADING
+    trading = set(_get_trading_usdt_symbols())
 
-def fetch_ticker_24h_all() -> List[Dict[str, Any]]:
-    data = _get_json(f"{BINANCE_BASE}/api/v3/ticker/24hr")
-    # Devuelve lista grande (todos los símbolos)
-    return data if isinstance(data, list) else []
+    # 2) 24h tickers
+    tickers = requests.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=60).json()
 
-
-def rank_candidates(limit_symbols: int) -> pd.DataFrame:
-    # 1) Símbolos USDT en estado TRADING
-    usdt_symbols = fetch_trading_usdt_symbols()
-    print(f"{time.strftime('%H:%M:%S')} TRADING USDT symbols: {len(usdt_symbols)}", flush=True)
-
-    # 2) Tickers 24h (todos) y filtramos por USDT
-    tickers = fetch_ticker_24h_all()
-    print(f"{time.strftime('%H:%M:%S')} Ticker 24h objetos: {len(tickers)}", flush=True)
-
+    # 3) Filtrar a sólo USDT TRADING y mapear campos
     rows: List[Dict[str, Any]] = []
-    usdt_set = set(usdt_symbols)
-
     for t in tickers:
-        sym = t.get("symbol")
-        if sym not in usdt_set:
-            continue
-        try:
-            quote_vol = float(t.get("quoteVolume", "0") or 0.0)
-            last_price = float(t.get("lastPrice", "0") or 0.0)
-            change_pct = float(t.get("priceChangePercent", "0") or 0.0)
-            high = float(t.get("highPrice", "0") or 0.0)
-            low = float(t.get("lowPrice", "0") or 0.0)
-            count = int(t.get("count", 0) or 0)
-            weighted = float(t.get("weightedAvgPrice", "0") or 0.0)
-        except Exception:
-            # Si viene algo raro, lo saltamos
+        sym = t.get("symbol", "")
+        if sym not in trading:
             continue
 
-        rows.append(
-            {
-                "symbol": sym,
-                "lastPrice": last_price,
-                "priceChangePercent": change_pct,
-                "highPrice": high,
-                "lowPrice": low,
-                "count": count,
-                "quoteVolume": quote_vol,
-                "weightedAvgPrice": weighted,
-            }
-        )
+        # Mapeo de campos esperados
+        rows.append({
+            "symbol": sym,
+            "lastPrice": t.get("lastPrice"),
+            "priceChangePercent": t.get("priceChangePercent"),
+            "highPrice": t.get("highPrice"),
+            "lowPrice": t.get("lowPrice"),
+            "count": t.get("count"),
+            "quoteVolume": t.get("quoteVolume"),
+            "weightedAvgPrice": t.get("weightedAvgPrice"),
+        })
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # 3) Orden por liquidez (quoteVolume) desc
-    df = df.sort_values(["quoteVolume", "count"], ascending=[False, False]).head(limit_symbols).reset_index(drop=True)
-    print(f"{time.strftime('%H:%M:%S')} Candidatos tras cruce & rank por liquidez: {df.shape[0]}", flush=True)
-    return df
-
-
-def write_csv(df: pd.DataFrame) -> None:
-    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(CSV_PATH, index=False)
-    print("CSV guardado en /tmp/usdt_screener.csv", flush=True)
-
-
-def run_screener(LIMIT_SYMBOLS: int = 150, MAX_WORKERS: int = 12, BUDGET: int = 110) -> None:
-    """
-    Punto de entrada invocable desde la app. MAX_WORKERS y BUDGET están
-    por compatibilidad con logs; aquí no usamos concurrencia.
-    """
-    _ = MAX_WORKERS  # sin uso
-    _ = BUDGET       # sin uso
-
-    df = rank_candidates(LIMIT_SYMBOLS)
-    if df.empty:
-        # Escribimos CSV vacío para diagnóstico (la app luego marcará error si no hay filas).
-        CSV_PATH.write_text("", encoding="utf-8")
-        return
-    write_csv(df)
-
-
-def main(LIMIT_SYMBOLS: int = 150, MAX_WORKERS: int = 12, BUDGET: int = 110) -> None:
-    # Permite ejecución como script directo
-    run_screener(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET)
-
-
-if __name__ == "__main__":
-    # Parámetros opcionales desde entorno/argv
-    lim = int(os.environ.get("LIMIT_SYMBOLS", "150"))
-    mw = int(os.environ.get("MAX_WORKERS", "12"))
-    bdg = int(os.environ.get("BUDGET", "110"))
-
-    # Permite override rápido por argumentos: python Binance_usdt_2.py 200
-    if len(sys.argv) >= 2:
+    # 4) ORDENAR por priceChangePercent (DESC)  ← **SOLICITADO**
+    def _to_float(x):
         try:
-            lim = int(sys.argv[1])
+            return float(x)
         except Exception:
-            pass
+            return float("-inf")
 
-    main(LIMIT_SYMBOLS=lim, MAX_WORKERS=mw, BUDGET=bdg)
+    rows.sort(key=lambda r: _to_float(r.get("priceChangePercent", 0.0)), reverse=True)
+
+    # 5) Limitar filas
+    if limit and limit > 0:
+        rows = rows[:limit]
+
+    elapsed = round(time.time() - t0, 3)
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "elapsed_sec": elapsed,
+    }

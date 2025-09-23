@@ -1,385 +1,282 @@
-import os
+# app.py
+from __future__ import annotations
+
+import csv
+import io
 import json
-import time
-import uuid
-import shutil
+import secrets
 import threading
-import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, List
+from textwrap import dedent
+from typing import Dict, Any, Optional
 
-from flask import Flask, Response, jsonify, redirect, request, send_file, make_response
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, StreamingResponse, JSONResponse
+from python_decouple import config
 
-# --- decouple (with fallback to os.environ) ---
-try:
-    from decouple import config  # pip install python-decouple
-except Exception:
-    def config(key: str, default: Optional[str] = None) -> str:
-        return os.environ.get(key, default or "")
+# ====== Config ======
+ENGINE_NAME = config("ENGINE", default="Binance_usdt_2")
+LIMIT_SYMBOLS = config("LIMIT_SYMBOLS", cast=int, default=150)
+MAX_WORKERS = config("MAX_WORKERS", cast=int, default=12)
+BUDGET = config("BUDGET", cast=int, default=110)
 
-# ---------------------------
-# Config
-# ---------------------------
-LIMIT_SYMBOLS = int(config("LIMIT_SYMBOLS", default="150"))
-MAX_WORKERS   = int(config("MAX_WORKERS", default="12"))
-BUDGET_SEC    = int(config("BUDGET",        default="110"))
+# ====== Motor (engines) ======
+# Por ahora sólo registramos el motor Binance_usdt_2
+from engines.binance_usdt_2 import run as binance_usdt_2_run  # noqa: E402
 
-CSV_TMP_PATH = Path("/tmp/usdt_screener.csv")
-JOBS_DIR = Path("/tmp/usd_jobs")
-JOBS_DIR.mkdir(parents=True, exist_ok=True)
+ENGINES = {
+    "Binance_usdt_2": binance_usdt_2_run,
+}
 
-# ---------------------------
-# App
-# ---------------------------
-app = Flask(__name__)
+# ====== App / Estado ======
+app = FastAPI(title="USDT Screener")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def now_utc_iso() -> str:
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+
+def _now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def job_json_path(job_id: str) -> Path:
-    return JOBS_DIR / f"{job_id}.json"
 
-def job_csv_path(job_id: str) -> Path:
-    return JOBS_DIR / f"{job_id}.csv"
+def _new_job_id() -> str:
+    return secrets.token_hex(5)  # p.ej. '65bf164352'
 
-def save_job(job_id: str, meta: Dict[str, Any]) -> None:
-    p = job_json_path(job_id)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-    p.touch()
 
-def read_job(job_id: str) -> Optional[Dict[str, Any]]:
-    p = job_json_path(job_id)
-    if not p.exists():
-        return None
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def gen_job_id() -> str:
-    return uuid.uuid4().hex[:10]
-
-def wait_for_file(path: Path, timeout: float = 12.0, poll: float = 0.25) -> bool:
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < timeout:
+def _start_job(job_id: str, engine: str, params: Dict[str, Any]) -> None:
+    """Lanza el motor en un hilo para no bloquear el servidor."""
+    def _worker():
         try:
-            if path.exists() and path.stat().st_size > 0:
-                return True
-        except Exception:
-            pass
-        time.sleep(poll)
-    return path.exists() and path.stat().st_size > 0
-
-def call_engine_and_wait() -> None:
-    """
-    Execute Binance_usdt_2 in several ways until one works.
-    It must write /tmp/usdt_screener.csv.
-    """
-    tried: List[str] = []
-
-    # 1) Import and call a known function
-    try:
-        import Binance_usdt_2 as engine  # type: ignore
-        for fname in ("run_screener", "run", "main"):
-            fn = getattr(engine, fname, None)
-            if callable(fn):
-                tried.append(f"import:{fname}")
-                fn(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)
+            func = ENGINES.get(engine)
+            if not func:
+                with _jobs_lock:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["ended"] = _now_utc_str()
+                    _jobs[job_id]["error"] = f"No encontré una función de entrada usable en el motor. Probé: {list(ENGINES.keys())}"
                 return
-            else:
-                tried.append(f"no:{fname}")
-    except Exception as e:
-        tried.append(f"import_error:{type(e).__name__}")
 
-    # 2) Run as module
-    try:
-        tried.append("subprocess:-m Binance_usdt_2")
-        subprocess.run(
-            ["python", "-m", "Binance_usdt_2"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=BUDGET_SEC + 30,
-        )
-        return
-    except Exception as e:
-        tried.append(f"mod_error:{type(e).__name__}")
+            result = func(params)  # debe devolver dict con keys: rows, count, etc.
+            # Asegurar consistencia mínima:
+            rows = result.get("rows", [])
+            count = result.get("count", len(rows))
 
-    # 3) Run the file directly if present
-    py_file = Path("Binance_usdt_2.py")
-    if py_file.exists():
-        try:
-            tried.append("subprocess:Binance_usdt_2.py")
-            subprocess.run(
-                ["python", str(py_file)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=BUDGET_SEC + 30,
-            )
-            return
-        except Exception as e:
-            tried.append(f"file_error:{type(e).__name__}")
+            with _jobs_lock:
+                _jobs[job_id].update({
+                    "status": "done",
+                    "rows": rows,
+                    "count": count,
+                    "ended": _now_utc_str(),
+                    "_engine": engine,
+                    "params": params,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+        except Exception as exc:  # pragma: no cover
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["ended"] = _now_utc_str()
+                _jobs[job_id]["error"] = f"{type(exc).__name__}: {exc}"
 
-    raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
-
-# ---------------------------
-# Background job
-# ---------------------------
-def background_job(job_id: str):
-    started = time.perf_counter()
-    meta: Dict[str, Any] = {
-        "job": job_id,
-        "status": "running",
-        "started": now_utc_iso(),
-        "params": {"LIMIT_SYMBOLS": LIMIT_SYMBOLS, "MAX_WORKERS": MAX_WORKERS, "BUDGET": BUDGET_SEC},
-    }
-    print(f"{datetime.utcnow().strftime('%H:%M:%S')} Iniciando job · LIMIT_SYMBOLS={LIMIT_SYMBOLS} "
-          f"MAX_WORKERS={MAX_WORKERS} BUDGET={BUDGET_SEC}s")
-    save_job(job_id, meta)
-
-    try:
-        call_engine_and_wait()
-
-        # Wait for CSV
-        csv_ready = CSV_TMP_PATH.exists() and wait_for_file(CSV_TMP_PATH, timeout=12.0, poll=0.25)
-        src_csv: Optional[Path] = CSV_TMP_PATH if csv_ready else None
-
-        if not src_csv:
-            for cand in sorted(Path("/tmp").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
-                if wait_for_file(cand, timeout=2.0, poll=0.2):
-                    src_csv = cand
-                    break
-
-        if not src_csv:
-            raise RuntimeError("El motor no produjo un CSV en /tmp (usdt_screener.csv u otro *.csv).")
-
-        dest = job_csv_path(job_id)
-        shutil.copyfile(src_csv, dest)
-
-        # Count rows
-        count_rows = 0
-        try:
-            import pandas as pd  # noqa
-            df = pd.read_csv(dest)
-            count_rows = int(df.shape[0])
-        except Exception as e:
-            raise RuntimeError(f"CSV copiado pero no se pudo leer: {e}")
-
-        if count_rows == 0:
-            raise RuntimeError("CSV generado pero sin filas.")
-
-        meta.update({
-            "status": "done",
-            "ended": now_utc_iso(),
-            "elapsed_sec": round(time.perf_counter() - started, 2),
-            "count": count_rows,
-            "_engine": "Binance_usdt_2",
-            "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
-        })
-        save_job(job_id, meta)
-
-    except Exception as e:
-        meta.update({
-            "status": "error",
-            "ended": now_utc_iso(),
-            "elapsed_sec": round(time.perf_counter() - started, 2),
-            "error": str(e),
-            "count": 0,
-        })
-        save_job(job_id, meta)
-        print(f"❌ Job {job_id} error: {e}")
-
-# ---------------------------
-# HTML (plain string; no f-strings)
-# ---------------------------
-VIEW_HTML = """<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>USD Screener · Job</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif;margin:18px;color:#222}
-  .muted{color:#666;font-size:12px}
-  .pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:600}
-  .ok{background:#e6ffed;color:#036e1e;border:1px solid #9de2b0}
-  .run{background:#fffbe6;color:#8a6d3b;border:1px solid #eed68a}
-  .err{background:#ffecec;color:#b00020;border:1px solid #ff9aa2}
-  .btn{color:#0b57d0;text-decoration:none}
-  pre{background:#f6f8fa;border:1px solid #e5e7eb;border-radius:8px;padding:12px;overflow:auto}
-  .row{margin:8px 0}
-  .hidden{display:none}
-</style>
-</head>
-<body>
-  <div id="app">
-    <div class="row"><strong id="title">Job</strong></div>
-    <div class="row" id="statusLine">
-      Estado: <span id="statusPill" class="pill run">iniciando…</span>
-      <span class="muted" id="times"></span>
-      · <a id="jsonLink" class="btn" href="#" target="_blank" rel="noreferrer">Ver JSON</a>
-      · <a id="csvLink" class="btn" href="#" download>Descargar CSV</a>
-    </div>
-    <div id="hint" class="row muted">Actualiza en unos segundos…</div>
-    <div id="rowsInfo" class="row muted"></div>
-    <div id="errorBox" class="row hidden"></div>
-  </div>
-
-<script>
-(function(){
-  const qs = new URLSearchParams(window.location.search);
-  const job = qs.get("job") || "";
-  const title = document.getElementById("title");
-  const pill = document.getElementById("statusPill");
-  const times = document.getElementById("times");
-  const jsonLink = document.getElementById("jsonLink");
-  const csvLink = document.getElementById("csvLink");
-  const errBox = document.getElementById("errorBox");
-  const rowsInfo = document.getElementById("rowsInfo");
-  const hint = document.getElementById("hint");
-
-  let timer = null;
-
-  function fmt(s){ return s ? s : ""; }
-  function setPill(status){
-    pill.textContent = status;
-    pill.classList.remove("ok","run","err");
-    if(status === "done") pill.classList.add("ok");
-    else if(status === "error") pill.classList.add("err");
-    else pill.classList.add("run");
-  }
-  function stopPolling(){
-    if (timer) { clearInterval(timer); timer = null; }
-    hint.classList.add("hidden");
-  }
-
-  function tick(){
-    if(!job){ title.textContent = "Sin job"; stopPolling(); return; }
-    title.textContent = "Job " + job;
-    document.title = "USD Screener · " + job;
-
-    fetch("/api?job=" + encodeURIComponent(job), {cache:"no-store"})
-      .then(r => r.json())
-      .then(data => {
-        const st = data.status || "running";
-        setPill(st);
-        times.textContent = "· inicio: " + fmt(data.started) + " · fin: " + fmt(data.ended || "");
-        jsonLink.href = "/api?job=" + encodeURIComponent(job);
-        csvLink.href = "/csv?job=" + encodeURIComponent(job);
-
-        if (st === "done") {
-          rowsInfo.textContent = "Listo ✅ · Filas: " + (data.count || 0);
-          stopPolling();
-        } else if (st === "error") {
-          rowsInfo.textContent = "";
-          errBox.classList.remove("hidden");
-          errBox.innerHTML = '<pre>' + (data.error || "Error desconocido") + '</pre>';
-          stopPolling();
-        } else {
-          rowsInfo.textContent = "Procesando…";
-          errBox.classList.add("hidden");
-          errBox.textContent = "";
-        }
-      })
-      .catch(_ => {});
-  }
-
-  tick();
-  timer = setInterval(tick, 5000);
-})();
-</script>
-</body>
-</html>
-"""
-
-# ---------------------------
-# Routes
-# ---------------------------
-
-# IMPORTANT: handle HEAD / so health checks don't start jobs
-@app.route("/", methods=["HEAD"])
-def head_root():
-    # OK for healthcheck; do NOT start a job
-    return Response(status=200)
-
-@app.after_request
-def no_cache(resp: Response):
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp
-
-@app.get("/")
-def index():
-    job_id = gen_job_id()
-    t = threading.Thread(target=background_job, args=(job_id,), daemon=True)
+    t = threading.Thread(target=_worker, daemon=True)
     t.start()
-    return redirect(f"/view?job={job_id}", code=302)
 
-@app.get("/view")
-def view():
-    resp = make_response(VIEW_HTML, 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
 
-@app.get("/api")
-def api():
-    job_id = request.args.get("job", "").strip()
-    if not job_id:
-        return jsonify({"error": "job requerido"}), 400
-    meta = read_job(job_id)
-    if not meta:
-        return jsonify({"error": "job no encontrado", "job": job_id}), 404
-    return jsonify(meta)
+@app.get("/", response_class=RedirectResponse)
+def root():
+    """Crea un job y redirige a /view?job=..."""
+    job_id = _new_job_id()
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job": job_id,
+            "status": "running",
+            "started": _now_utc_str(),
+            "rows": [],
+            "count": 0,
+        }
+    params = {
+        "LIMIT_SYMBOLS": LIMIT_SYMBOLS,
+        "MAX_WORKERS": MAX_WORKERS,
+        "BUDGET": BUDGET,
+    }
+    _start_job(job_id, ENGINE_NAME, params)
+    return f"/view?job={job_id}"
 
-@app.get("/csv")
-def csv_for_job():
-    job_id = request.args.get("job", "").strip()
-    if not job_id:
-        return Response("job requerido", status=400)
-    p = job_csv_path(job_id)
-    if not p.exists():
-        return Response("CSV aún no disponible", status=202)
-    return send_file(
-        str(p),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=f"usdt_screener_{job_id}.csv",
-        max_age=0,
-        conditional=False,
-        etag=False,
-        last_modified=None,
-    )
 
-@app.get("/csv_tmp")
-def csv_tmp():
-    # Convenience endpoint to fetch whatever CSV the engine left under /tmp
-    if CSV_TMP_PATH.exists() and CSV_TMP_PATH.stat().st_size > 0:
-        p = CSV_TMP_PATH
+@app.get("/api", response_class=JSONResponse)
+def api(job: str):
+    with _jobs_lock:
+        data = _jobs.get(job)
+        if not data:
+            raise HTTPException(404, "Job no encontrado")
+        return data
+
+
+@app.get("/csv", response_class=StreamingResponse)
+def csv_endpoint(job: str):
+    with _jobs_lock:
+        data = _jobs.get(job)
+        if not data:
+            raise HTTPException(404, "Job no encontrado")
+        if data["status"] == "running":
+            # 202 Accepted mientras el job corre
+            return Response("Aún generando…", status_code=202, media_type="text/plain")
+
+        if data["status"] == "error":
+            return Response(f"error: {data.get('error','')}", status_code=400, media_type="text/plain")
+
+        rows = list(data.get("rows", []))
+    # Seguridad: reordenamos aquí por si el motor futuro no lo hiciera.
+    def _to_float(x: Any) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float("nan")
+
+    rows.sort(key=lambda r: _to_float(r.get("priceChangePercent", 0.0)), reverse=True)
+
+    # CSV
+    if not rows:
+        header = ["symbol", "lastPrice", "priceChangePercent", "highPrice", "lowPrice",
+                  "count", "quoteVolume", "weightedAvgPrice"]
     else:
-        cands = sorted(Path("/tmp").glob("*.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
-        p = cands[0] if cands else None
-    if not p:
-        return Response("No hay CSV en /tmp", status=404)
-    return send_file(
-        str(p),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=p.name,
-        max_age=0,
-        conditional=False,
-        etag=False,
-        last_modified=None,
+        header = list(rows[0].keys())
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=header)
+    writer.writeheader()
+    writer.writerows(rows)
+    buf.seek(0)
+
+    filename = f"usdt_screener_{job}.csv"
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True, threaded=True)
+
+@app.get("/view", response_class=HTMLResponse)
+def view(job: str):
+    # HTML + JS. OJO con las llaves: se escapan como {{ }} para que el f-string no las interprete.
+    html = dedent(f"""
+    <!doctype html>
+    <html lang="es">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Job {job}</title>
+      <style>
+        :root {{
+          --fg:#222; --muted:#666; --ok:#0a7; --err:#c33;
+          --row:#fafafa; --row2:#f3f3f3; --bd:#e5e5e5;
+        }}
+        body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; color:var(--fg); margin:18px; }}
+        .badge {{ font-size:12px; padding:2px 6px; border-radius:10px; border:1px solid var(--bd); }}
+        .running {{ background:#fff7e6; border-color:#ffd28c; }}
+        .done {{ background:#e7fbf3; border-color:#b3ecd8; }}
+        .error {{ background:#fdecec; border-color:#f5bcbc; }}
+        table {{ border-collapse: collapse; width: 100%; margin-top:12px; }}
+        th, td {{ border:1px solid var(--bd); padding:6px 8px; font-size: 13px; }}
+        th {{ background:#f8f8f8; position: sticky; top:0; z-index:1; }}
+        tr:nth-child(odd) td {{ background: var(--row); }}
+        tr:nth-child(even) td {{ background: var(--row2); }}
+        .muted {{ color:var(--muted); }}
+        .controls {{ margin: 12px 0; display:flex; gap:10px; align-items: center; flex-wrap: wrap; }}
+        .hint {{ font-size:12px; color:var(--muted); }}
+        .right {{ text-align:right; }}
+      </style>
+    </head>
+    <body>
+      <h1>Job {job}</h1>
+      <div id="meta" class="muted">Cargando…</div>
+
+      <div class="controls">
+        <a id="jsonLink" class="badge" href="/api?job={job}">Ver JSON</a>
+        <a id="csvLink"  class="badge" href="/csv?job={job}">Descargar CSV</a>
+        <span class="hint">Orden: <b>priceChangePercent</b> de mayor a menor.</span>
+      </div>
+
+      <div id="status"></div>
+      <div id="error" class="error" style="display:none; padding:8px; border-radius:8px;"></div>
+
+      <div id="tableWrap"></div>
+
+      <script>
+        const job = "{job}";
+
+        const fmt = (s) => s ? new Date(s.replace(" UTC","Z")).toLocaleString() : "—";
+
+        async function refresh() {{
+          const res = await fetch(`/api?job=${{job}}`, {{ cache: "no-store" }});
+          const data = await res.json();
+
+          const meta = document.getElementById("meta");
+          meta.textContent = `Estado: ${{data.status}} · inicio: ${{fmt(data.started)}} · fin: ${{fmt(data.ended || '')}} · Filas: ${{data.count||0}}`;
+
+          const errBox = document.getElementById("error");
+          if (data.status === "error") {{
+            errBox.style.display = "block";
+            errBox.textContent = data.error || "Error";
+            return;
+          }}
+
+          if (data.status !== "done") {{
+            // Mientras corre, evitamos renderizar una tabla vacía
+            setTimeout(refresh, 1500);
+            return;
+          }}
+
+          // 1) Ordenar por priceChangePercent (desc)
+          const rows = (data.rows||[]).slice().sort((a,b) => {{
+            const A = parseFloat(a.priceChangePercent || 0);
+            const B = parseFloat(b.priceChangePercent || 0);
+            if (Number.isNaN(A) && Number.isNaN(B)) return 0;
+            if (Number.isNaN(A)) return 1;
+            if (Number.isNaN(B)) return -1;
+            return B - A;
+          }});
+
+          // 2) Render
+          const headers = rows.length ? Object.keys(rows[0]) : ["symbol","lastPrice","priceChangePercent","highPrice","lowPrice","count","quoteVolume","weightedAvgPrice"];
+          const wrap = document.getElementById("tableWrap");
+          const tbl = document.createElement("table");
+          const thead = document.createElement("thead");
+          const trh = document.createElement("tr");
+          headers.forEach(h => {{
+            const th = document.createElement("th");
+            th.textContent = h;
+            trh.appendChild(th);
+          }});
+          thead.appendChild(trh);
+          tbl.appendChild(thead);
+
+          const tbody = document.createElement("tbody");
+          rows.forEach(r => {{
+            const tr = document.createElement("tr");
+            headers.forEach(h => {{
+              const td = document.createElement("td");
+              td.textContent = (r[h] === null || r[h] === undefined) ? "" : r[h];
+              if (["lastPrice","priceChangePercent","highPrice","lowPrice","count","quoteVolume","weightedAvgPrice"].includes(h)) {{
+                td.classList.add("right");
+              }}
+              tr.appendChild(td);
+            }});
+            tbody.appendChild(tr);
+          }});
+          tbl.appendChild(tbody);
+
+          wrap.innerHTML = "";
+          wrap.appendChild(tbl);
+        }}
+
+        refresh();
+      </script>
+    </body>
+    </html>
+    """)
+    return HTMLResponse(html)
+
+
+# Para ejecutar local si hace falta: uvicorn app:app --reload
+if __name__ == "__main__":  # pragma: no cover
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

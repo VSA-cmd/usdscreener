@@ -5,3 +5,8 @@ pandas
 numpy
 python-decouple
 plotly
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+gunicorn==23.0.0
+requests==2.32.3
+python-decouple==3.8
