@@ -11,10 +11,10 @@ from typing import Any, Dict, Optional, List
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, make_response
 
-# --- decouple (con fallback a os.environ) ---
+# --- decouple (with fallback to os.environ) ---
 try:
     from decouple import config  # pip install python-decouple
-except Exception:  # si no está instalado, leer desde el entorno
+except Exception:
     def config(key: str, default: Optional[str] = None) -> str:
         return os.environ.get(key, default or "")
 
@@ -35,7 +35,7 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 
 # ---------------------------
-# Utilidades
+# Utilities
 # ---------------------------
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -78,12 +78,12 @@ def wait_for_file(path: Path, timeout: float = 12.0, poll: float = 0.25) -> bool
 
 def call_engine_and_wait() -> None:
     """
-    Intenta ejecutar el motor Binance_usdt_2 de varias formas.
-    Debe escribir /tmp/usdt_screener.csv.
+    Execute Binance_usdt_2 in several ways until one works.
+    It must write /tmp/usdt_screener.csv.
     """
     tried: List[str] = []
 
-    # 1) Importar y llamar funciones conocidas
+    # 1) Import and call a known function
     try:
         import Binance_usdt_2 as engine  # type: ignore
         for fname in ("run_screener", "run", "main"):
@@ -97,7 +97,7 @@ def call_engine_and_wait() -> None:
     except Exception as e:
         tried.append(f"import_error:{type(e).__name__}")
 
-    # 2) Ejecutar como módulo
+    # 2) Run as module
     try:
         tried.append("subprocess:-m Binance_usdt_2")
         subprocess.run(
@@ -112,7 +112,7 @@ def call_engine_and_wait() -> None:
     except Exception as e:
         tried.append(f"mod_error:{type(e).__name__}")
 
-    # 3) Ejecutar el archivo directamente si existe
+    # 3) Run the file directly if present
     py_file = Path("Binance_usdt_2.py")
     if py_file.exists():
         try:
@@ -132,7 +132,7 @@ def call_engine_and_wait() -> None:
     raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
 
 # ---------------------------
-# Trabajo en background
+# Background job
 # ---------------------------
 def background_job(job_id: str):
     started = time.perf_counter()
@@ -149,12 +149,11 @@ def background_job(job_id: str):
     try:
         call_engine_and_wait()
 
-        # Espera CSV
+        # Wait for CSV
         csv_ready = CSV_TMP_PATH.exists() and wait_for_file(CSV_TMP_PATH, timeout=12.0, poll=0.25)
-        src_csv = None
-        if csv_ready:
-            src_csv = CSV_TMP_PATH
-        else:
+        src_csv: Optional[Path] = CSV_TMP_PATH if csv_ready else None
+
+        if not src_csv:
             for cand in sorted(Path("/tmp").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
                 if wait_for_file(cand, timeout=2.0, poll=0.2):
                     src_csv = cand
@@ -166,11 +165,11 @@ def background_job(job_id: str):
         dest = job_csv_path(job_id)
         shutil.copyfile(src_csv, dest)
 
+        # Count rows
         count_rows = 0
         try:
             import pandas as pd  # noqa
-            import pandas  # noqa
-            df = pandas.read_csv(dest)
+            df = pd.read_csv(dest)
             count_rows = int(df.shape[0])
         except Exception as e:
             raise RuntimeError(f"CSV copiado pero no se pudo leer: {e}")
@@ -200,7 +199,7 @@ def background_job(job_id: str):
         print(f"❌ Job {job_id} error: {e}")
 
 # ---------------------------
-# HTML (no f-strings)
+# HTML (plain string; no f-strings)
 # ---------------------------
 VIEW_HTML = """<!doctype html>
 <html lang="es">
@@ -225,14 +224,14 @@ VIEW_HTML = """<!doctype html>
   <div id="app">
     <div class="row"><strong id="title">Job</strong></div>
     <div class="row" id="statusLine">
-      Estado: <span id="statusPill" class="pill run">cargando…</span>
+      Estado: <span id="statusPill" class="pill run">iniciando…</span>
       <span class="muted" id="times"></span>
       · <a id="jsonLink" class="btn" href="#" target="_blank" rel="noreferrer">Ver JSON</a>
       · <a id="csvLink" class="btn" href="#" download>Descargar CSV</a>
     </div>
+    <div id="hint" class="row muted">Actualiza en unos segundos…</div>
+    <div id="rowsInfo" class="row muted"></div>
     <div id="errorBox" class="row hidden"></div>
-    <div class="row muted">Actualiza en unos segundos…</div>
-    <div class="row muted" id="rowsInfo"></div>
   </div>
 
 <script>
@@ -246,6 +245,9 @@ VIEW_HTML = """<!doctype html>
   const csvLink = document.getElementById("csvLink");
   const errBox = document.getElementById("errorBox");
   const rowsInfo = document.getElementById("rowsInfo");
+  const hint = document.getElementById("hint");
+
+  let timer = null;
 
   function fmt(s){ return s ? s : ""; }
   function setPill(status){
@@ -255,28 +257,35 @@ VIEW_HTML = """<!doctype html>
     else if(status === "error") pill.classList.add("err");
     else pill.classList.add("run");
   }
+  function stopPolling(){
+    if (timer) { clearInterval(timer); timer = null; }
+    hint.classList.add("hidden");
+  }
 
   function tick(){
-    if(!job){ title.textContent = "Sin job"; return; }
+    if(!job){ title.textContent = "Sin job"; stopPolling(); return; }
     title.textContent = "Job " + job;
+    document.title = "USD Screener · " + job;
+
     fetch("/api?job=" + encodeURIComponent(job), {cache:"no-store"})
       .then(r => r.json())
       .then(data => {
-        setPill(data.status || "running");
+        const st = data.status || "running";
+        setPill(st);
         times.textContent = "· inicio: " + fmt(data.started) + " · fin: " + fmt(data.ended || "");
         jsonLink.href = "/api?job=" + encodeURIComponent(job);
         csvLink.href = "/csv?job=" + encodeURIComponent(job);
 
-        if (data.status === "done") {
-          rowsInfo.textContent = "Filas: " + (data.count || 0);
-        } else {
+        if (st === "done") {
+          rowsInfo.textContent = "Listo ✅ · Filas: " + (data.count || 0);
+          stopPolling();
+        } else if (st === "error") {
           rowsInfo.textContent = "";
-        }
-
-        if (data.status === "error") {
           errBox.classList.remove("hidden");
           errBox.innerHTML = '<pre>' + (data.error || "Error desconocido") + '</pre>';
+          stopPolling();
         } else {
+          rowsInfo.textContent = "Procesando…";
           errBox.classList.add("hidden");
           errBox.textContent = "";
         }
@@ -285,7 +294,7 @@ VIEW_HTML = """<!doctype html>
   }
 
   tick();
-  setInterval(tick, 5000);
+  timer = setInterval(tick, 5000);
 })();
 </script>
 </body>
@@ -293,8 +302,15 @@ VIEW_HTML = """<!doctype html>
 """
 
 # ---------------------------
-# Rutas
+# Routes
 # ---------------------------
+
+# IMPORTANT: handle HEAD / so health checks don't start jobs
+@app.route("/", methods=["HEAD"])
+def head_root():
+    # OK for healthcheck; do NOT start a job
+    return Response(status=200)
+
 @app.after_request
 def no_cache(resp: Response):
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -346,6 +362,7 @@ def csv_for_job():
 
 @app.get("/csv_tmp")
 def csv_tmp():
+    # Convenience endpoint to fetch whatever CSV the engine left under /tmp
     if CSV_TMP_PATH.exists() and CSV_TMP_PATH.stat().st_size > 0:
         p = CSV_TMP_PATH
     else:
