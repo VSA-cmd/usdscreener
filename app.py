@@ -17,8 +17,8 @@ LIMIT_SYMBOLS = int(os.getenv("LIMIT_SYMBOLS", "150"))
 MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "12"))
 BUDGET_SEC    = int(os.getenv("BUDGET", "110"))  # segundos
 
-CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")         # donde el motor guarda “siempre”
-JOBS_DIR      = Path("/tmp/jobs")                      # persistimos estado por job
+CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")   # donde el motor guarda siempre
+JOBS_DIR      = Path("/tmp/jobs")                # persistimos estado por job
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -42,31 +42,24 @@ except Exception:
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# Estructuras en memoria (por worker). Persistimos a disco para compartir entre workers.
 JOBS_LOCK = threading.Lock()
-JOBS = {}  # job_id -> dict en memoria (opcional, la verdad mandamos todo a disco)
-
+JOBS = {}  # job_id -> dict
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-
 def job_json_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
-
 
 def job_csv_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.csv"
 
-
 def save_job(job_id: str, payload: dict) -> None:
-    """Persistimos a disco (para que otros workers vean el estado)."""
     payload["_engine"] = engine_name
     payload["_updated_utc"] = now_utc_iso()
     job_json_path(job_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     with JOBS_LOCK:
         JOBS[job_id] = payload
-
 
 def load_job(job_id: str) -> dict | None:
     p = job_json_path(job_id)
@@ -81,29 +74,23 @@ def load_job(job_id: str) -> dict | None:
     with JOBS_LOCK:
         return JOBS.get(job_id)
 
-
 def call_engine_and_wait():
     """
-    Intentamos ejecutar el motor sin suponer nombres exactos.
-    Convención: el motor escribe /tmp/usdt_screener.csv.
+    Ejecuta la función principal del motor y deja el CSV en CSV_TMP_PATH.
     """
     if engine is None:
         raise RuntimeError("No se pudo importar el motor (Binance_usdt_2 / Binance_usdt).")
 
-    # Probamos varias firmas. Si alguna existe, la usamos.
     tried = []
 
-    # 1) run_screener(LIMIT_SYMBOLS, MAX_WORKERS, BUDGET)
     if hasattr(engine, "run_screener"):
         tried.append("run_screener")
         return engine.run_screener(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
 
-    # 2) run(**kwargs)
     if hasattr(engine, "run"):
         tried.append("run")
         return engine.run(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
 
-    # 3) main(**kwargs) o main() a secas
     if hasattr(engine, "main"):
         tried.append("main")
         try:
@@ -111,7 +98,6 @@ def call_engine_and_wait():
         except TypeError:
             return engine.main()  # type: ignore
 
-    # 4) fallback: screener(), start(), etc.
     for fname in ("screener", "start", "execute"):
         if hasattr(engine, fname):
             tried.append(fname)
@@ -122,7 +108,6 @@ def call_engine_and_wait():
                 return fn()  # type: ignore
 
     raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
-
 
 def background_job(job_id: str):
     started = time.perf_counter()
@@ -137,18 +122,13 @@ def background_job(job_id: str):
     save_job(job_id, meta)
 
     try:
-        # Ejecutamos el motor (debería dejar el CSV en CSV_TMP_PATH)
         call_engine_and_wait()
 
-        # Si existe el CSV temporal del motor, lo copiamos y lo usamos como fuente de verdad por job
         if CSV_TMP_PATH.exists():
-            # Copia per-job
             shutil.copyfile(CSV_TMP_PATH, job_csv_path(job_id))
         else:
-            # No hay CSV → seguimos, pero lo registramos
             print("⚠️  El motor terminó pero no encontré /tmp/usdt_screener.csv")
 
-        # Cargamos filas si hay CSV (aunque sea parcial)
         rows = []
         if job_csv_path(job_id).exists():
             try:
@@ -168,7 +148,6 @@ def background_job(job_id: str):
         })
         save_job(job_id, meta)
     except Exception as e:
-        # Si hay CSV parcial, igual lo exponemos
         rows = []
         if job_csv_path(job_id).exists():
             try:
@@ -189,10 +168,8 @@ def background_job(job_id: str):
         save_job(job_id, meta)
         print(f"❌ Job {job_id} error: {e}")
 
-
 def start_new_job() -> str:
     job_id = uuid.uuid4().hex[:10]
-    # Creamos un JSON inicial para que /view lo encuentre de inmediato
     save_job(job_id, {
         "job": job_id,
         "status": "queued",
@@ -203,27 +180,21 @@ def start_new_job() -> str:
     t.start()
     return job_id
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Rutas
 # ────────────────────────────────────────────────────────────────────────────────
-
 @app.after_request
 def no_cache(resp: Response):
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
-
 @app.get("/")
 def index():
-    # Cada visita dispara un job nuevo y redirige al viewer
     job_id = start_new_job()
     return redirect(url_for("view_job", job=job_id), code=302)
 
-
 @app.get("/view")
 def view_job():
-    # Importante: NO 404 aunque no exista todavía el JSON. El frontend consulta /api.
     job_id = request.args.get("job", "").strip() or start_new_job()
 
     html = f"""<!doctype html>
@@ -268,6 +239,83 @@ def view_job():
       if (data.status === 'error') badge = '<span class="pill err">error</span>';
 
       st.innerHTML = `
-        <div class="row">Estado: ${badge}
-          · inicio: ${fmt(data.started)} · fin: ${fmt(data.ended || '')}
-          · <a href="/api?job=${jobId}" target="_blank">Ver JSON</a>
+        <div class="row">Estado: ${{badge}}
+          · inicio: ${{fmt(data.started)}} · fin: ${{fmt(data.ended || '')}}
+          · <a href="/api?job=${{jobId}}" target="_blank">Ver JSON</a>
+          · <a href="/csv?job=${{jobId}}" id="csvlink">Descargar CSV</a>
+        </div>
+      `;
+
+      links.innerHTML = '';
+      if (data.error) {{
+        const p = document.createElement('div');
+        p.className = 'row tiny err';
+        p.textContent = data.error;
+        links.appendChild(p);
+      }}
+      if (data.count !== undefined) {{
+        const p = document.createElement('div');
+        p.className = 'row tiny muted';
+        p.textContent = 'Filas: ' + data.count + (data.elapsed_sec ? ' · t=' + data.elapsed_sec + 's' : '');
+        links.appendChild(p);
+      }}
+    }}
+
+    async function tick() {{
+      try {{
+        const r = await fetch('/api?job=' + jobId, {{ cache:'no-store' }});
+        if (r.status === 200) {{
+          const data = await r.json();
+          render(data);
+          if (data.status === 'done' || data.status === 'error') {{
+            clearInterval(h);
+          }}
+        }} else {{
+          st.textContent = 'Job no encontrado (aún).';
+        }}
+      }} catch(e) {{
+        st.textContent = 'Esperando...';
+      }}
+    }}
+    const h = setInterval(tick, 3500);
+    tick();
+  </script>
+</body>
+</html>"""
+    return make_response(html, 200)
+
+@app.get("/api")
+def job_api():
+    job_id = (request.args.get("job") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job requerido"}), 400
+    data = load_job(job_id)
+    if not data:
+        return jsonify({"error": "Job not found", "job": job_id}), 404
+    return jsonify(data)
+
+@app.get("/csv")
+def job_csv():
+    job_id = (request.args.get("job") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job requerido"}), 400
+    csvp = job_csv_path(job_id)
+    if not csvp.exists():
+        return Response("CSV no listo", 202, mimetype="text/plain")
+    return send_file(csvp, as_attachment=True, download_name=f"usdt_screener_{job_id}.csv")
+
+@app.get("/csv_tmp")
+def csv_tmp():
+    """Descarga directa del último CSV que dejó el motor."""
+    if not CSV_TMP_PATH.exists():
+        return Response("No existe /tmp/usdt_screener.csv aún.", 404, mimetype="text/plain")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return send_file(CSV_TMP_PATH, as_attachment=True, download_name=f"usdt_screener_{ts}.csv")
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True, "time": now_utc_iso(), "engine": engine_name})
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
