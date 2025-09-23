@@ -1,269 +1,273 @@
-# -*- coding: utf-8 -*-
-import io
+# app.py
 import os
 import json
+import time
 import uuid
+import shutil
 import threading
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 
-import pandas as pd
-from flask import (
-    Flask, request, Response, send_file,
-    render_template_string, redirect, url_for
-)
+from flask import Flask, redirect, request, jsonify, send_file, url_for, Response, make_response
 
-# Motor de cálculo (ligero para Render)
-import Binance_usdt_2 as engine  # asegura el nombre correcto del archivo
+# ────────────────────────────────────────────────────────────────────────────────
+# Configuración
+# ────────────────────────────────────────────────────────────────────────────────
+LIMIT_SYMBOLS = int(os.getenv("LIMIT_SYMBOLS", "150"))
+MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "12"))
+BUDGET_SEC    = int(os.getenv("BUDGET", "110"))  # segundos
 
-# =================== Config ===================
+CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")         # donde el motor guarda “siempre”
+JOBS_DIR      = Path("/tmp/jobs")                      # persistimos estado por job
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Carga del motor (soportamos ambos nombres)
+# ────────────────────────────────────────────────────────────────────────────────
+engine = None
+engine_name = None
+try:
+    import Binance_usdt_2 as engine  # type: ignore
+    engine_name = "Binance_usdt_2"
+except Exception:
+    try:
+        import Binance_usdt as engine  # type: ignore
+        engine_name = "Binance_usdt"
+    except Exception:
+        engine = None
+        engine_name = None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# App
+# ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-TOP_N = int(os.environ.get("TOP_N", "100"))  # filas a mostrar
-JOBS_DIR = Path("/tmp/jobs")
-JOBS_DIR.mkdir(parents=True, exist_ok=True)  # storage compartido entre workers
-CSV_GLOBAL = Path("/tmp/usdt_screener.csv")  # si el motor lo guarda aquí
-
-# =================== Utilidades ===================
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+# Estructuras en memoria (por worker). Persistimos a disco para compartir entre workers.
+JOBS_LOCK = threading.Lock()
+JOBS = {}  # job_id -> dict en memoria (opcional, la verdad mandamos todo a disco)
 
 
-def job_path(job_id: str) -> Path:
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def job_json_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
 
 
-def write_json_atomic(path: Path, payload: dict):
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)  # atómico en el mismo filesystem
+def job_csv_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.csv"
 
 
-def read_json(path: Path) -> dict | None:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+def save_job(job_id: str, payload: dict) -> None:
+    """Persistimos a disco (para que otros workers vean el estado)."""
+    payload["_engine"] = engine_name
+    payload["_updated_utc"] = now_utc_iso()
+    job_json_path(job_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    with JOBS_LOCK:
+        JOBS[job_id] = payload
 
 
-def rows_from_df(df: pd.DataFrame, top_n: int) -> list[dict]:
-    cols_pref = [
-        "symbol", "price", "pct_change_24h", "quote_volume_24h",
-        "Trend_4H", "ScoreTrend", "fundingRate",
-        "openInterest", "oi_delta", "NetScore", "GHI"
-    ]
-    cols = [c for c in cols_pref if c in df.columns]
-    slim = df[cols].head(top_n).copy()
-
-    out = []
-    for _, r in slim.iterrows():
-        d = {}
-        for k, v in r.items():
-            if pd.isna(v):
-                d[k] = None
-            elif isinstance(v, (int, float)):
-                d[k] = float(v)
-            else:
-                d[k] = v
-        out.append(d)
-    return out
-
-
-def _run_job(job_id: str):
-    """Ejecuta el motor en un hilo, guarda JSON y CSV de ese job."""
-    jp = job_path(job_id)
-    payload = {"job": job_id, "status": "running", "started": now_utc()}
-    write_json_atomic(jp, payload)
-
-    try:
-        # Ejecuta motor: debe devolver (DataFrame, info_dict)
-        df, info = engine.build_df()  # respeta LIMIT_SYMBOLS/MAX_WORKERS/BUDGET via ENV
-
-        if df is None or df.empty:
-            payload.update({
-                "status": "error",
-                "ended": now_utc(),
-                "error": "No data returned by engine",
-            })
-            write_json_atomic(jp, payload)
-            return
-
-        # Guardamos CSV específico por job
-        csv_job = JOBS_DIR / f"usdt_screener_{job_id}.csv"
+def load_job(job_id: str) -> dict | None:
+    p = job_json_path(job_id)
+    if p.exists():
         try:
-            df.to_csv(csv_job, index=False)
+            data = json.loads(p.read_text(encoding="utf-8") or "{}")
+            with JOBS_LOCK:
+                JOBS[job_id] = data
+            return data
         except Exception:
-            # backup: generar CSV solo con columnas visibles
-            rows = rows_from_df(df, len(df))
-            pd.DataFrame(rows).to_csv(csv_job, index=False)
+            return None
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
 
-        rows = rows_from_df(df, TOP_N)
 
-        payload.update({
+def call_engine_and_wait():
+    """
+    Intentamos ejecutar el motor sin suponer nombres exactos.
+    Convención: el motor escribe /tmp/usdt_screener.csv.
+    """
+    if engine is None:
+        raise RuntimeError("No se pudo importar el motor (Binance_usdt_2 / Binance_usdt).")
+
+    # Probamos varias firmas. Si alguna existe, la usamos.
+    tried = []
+
+    # 1) run_screener(LIMIT_SYMBOLS, MAX_WORKERS, BUDGET)
+    if hasattr(engine, "run_screener"):
+        tried.append("run_screener")
+        return engine.run_screener(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+
+    # 2) run(**kwargs)
+    if hasattr(engine, "run"):
+        tried.append("run")
+        return engine.run(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+
+    # 3) main(**kwargs) o main() a secas
+    if hasattr(engine, "main"):
+        tried.append("main")
+        try:
+            return engine.main(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+        except TypeError:
+            return engine.main()  # type: ignore
+
+    # 4) fallback: screener(), start(), etc.
+    for fname in ("screener", "start", "execute"):
+        if hasattr(engine, fname):
+            tried.append(fname)
+            fn = getattr(engine, fname)
+            try:
+                return fn(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+            except TypeError:
+                return fn()  # type: ignore
+
+    raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
+
+
+def background_job(job_id: str):
+    started = time.perf_counter()
+    meta = {
+        "job": job_id,
+        "status": "running",
+        "started": now_utc_iso(),
+        "params": {"LIMIT_SYMBOLS": LIMIT_SYMBOLS, "MAX_WORKERS": MAX_WORKERS, "BUDGET": BUDGET_SEC},
+    }
+    print(f"{datetime.utcnow().strftime('%H:%M:%S')} Iniciando job · LIMIT_SYMBOLS={LIMIT_SYMBOLS} "
+          f"MAX_WORKERS={MAX_WORKERS} BUDGET={BUDGET_SEC}s")
+    save_job(job_id, meta)
+
+    try:
+        # Ejecutamos el motor (debería dejar el CSV en CSV_TMP_PATH)
+        call_engine_and_wait()
+
+        # Si existe el CSV temporal del motor, lo copiamos y lo usamos como fuente de verdad por job
+        if CSV_TMP_PATH.exists():
+            # Copia per-job
+            shutil.copyfile(CSV_TMP_PATH, job_csv_path(job_id))
+        else:
+            # No hay CSV → seguimos, pero lo registramos
+            print("⚠️  El motor terminó pero no encontré /tmp/usdt_screener.csv")
+
+        # Cargamos filas si hay CSV (aunque sea parcial)
+        rows = []
+        if job_csv_path(job_id).exists():
+            try:
+                import pandas as pd
+                df = pd.read_csv(job_csv_path(job_id))
+                rows = df.to_dict(orient="records")
+            except Exception as e:
+                print(f"⚠️  No pude leer el CSV del job {job_id}: {e}")
+
+        meta.update({
             "status": "done",
-            "ended": now_utc(),
+            "ended": now_utc_iso(),
+            "elapsed_sec": round(time.perf_counter() - started, 2),
+            "count": len(rows),
             "rows": rows,
-            "info": info or {},
-            "csv_path": str(csv_job),
+            "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
         })
-        write_json_atomic(jp, payload)
-
+        save_job(job_id, meta)
     except Exception as e:
-        payload.update({
-            "status": "error",
-            "ended": now_utc(),
-            "error": str(e),
-        })
-        write_json_atomic(jp, payload)
+        # Si hay CSV parcial, igual lo exponemos
+        rows = []
+        if job_csv_path(job_id).exists():
+            try:
+                import pandas as pd
+                df = pd.read_csv(job_csv_path(job_id))
+                rows = df.to_dict(orient="records")
+            except Exception:
+                pass
 
-# =================== Rutas ===================
+        meta.update({
+            "status": "error",
+            "ended": now_utc_iso(),
+            "elapsed_sec": round(time.perf_counter() - started, 2),
+            "error": str(e),
+            "count": len(rows),
+            "rows": rows,
+        })
+        save_job(job_id, meta)
+        print(f"❌ Job {job_id} error: {e}")
+
+
+def start_new_job() -> str:
+    job_id = uuid.uuid4().hex[:10]
+    # Creamos un JSON inicial para que /view lo encuentre de inmediato
+    save_job(job_id, {
+        "job": job_id,
+        "status": "queued",
+        "started": now_utc_iso(),
+        "params": {"LIMIT_SYMBOLS": LIMIT_SYMBOLS, "MAX_WORKERS": MAX_WORKERS, "BUDGET": BUDGET_SEC},
+    })
+    t = threading.Thread(target=background_job, args=(job_id,), daemon=True)
+    t.start()
+    return job_id
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Rutas
+# ────────────────────────────────────────────────────────────────────────────────
+
+@app.after_request
+def no_cache(resp: Response):
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
 
 @app.get("/")
-def home():
-    """Lanza un job y redirige a /view?job=..."""
-    job_id = uuid.uuid4().hex[:10]
-    # crea archivo de estado antes de lanzar el hilo (visible a todos los workers)
-    write_json_atomic(job_path(job_id), {
-        "job": job_id, "status": "running", "started": now_utc()
-    })
-    t = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
-    t.start()
-    return redirect(url_for("view_job", job=job_id))
+def index():
+    # Cada visita dispara un job nuevo y redirige al viewer
+    job_id = start_new_job()
+    return redirect(url_for("view_job", job=job_id), code=302)
 
 
 @app.get("/view")
 def view_job():
-    job = request.args.get("job")
-    jp = job_path(job) if job else None
-    j = read_json(jp) if jp else None
-    if not j:
-        return "Job not found", 404
+    # Importante: NO 404 aunque no exista todavía el JSON. El frontend consulta /api.
+    job_id = request.args.get("job", "").strip() or start_new_job()
 
-    tpl = """
-<!doctype html>
-<html>
+    html = f"""<!doctype html>
+<html lang="es">
 <head>
-  <meta charset="utf-8"/>
-  <title>Job {{ job }}</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Job {job_id}</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: right; }
-    th { background: #f5f5f5; }
-    td:first-child, th:first-child { text-align: left; }
-    .muted { color: #777; }
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial, sans-serif;
+           line-height:1.45; margin: 24px; color:#0f172a; }}
+    .muted {{ color:#64748b; font-size:.9rem; }}
+    .pill  {{ display:inline-block; padding:.2rem .5rem; border-radius:999px; background:#e2e8f0; }}
+    .ok    {{ background:#dcfce7; }}
+    .err   {{ background:#fee2e2; }}
+    a {{ color:#2563eb; text-decoration:none; }}
+    a:hover {{ text-decoration:underline; }}
+    .row {{ margin-top:.35rem; }}
+    .tiny {{ font-size:.85rem; }}
   </style>
 </head>
 <body>
-  <h3>Job {{ job }}</h3>
-  <p>
-    Estado: <b>{{ j["status"] }}</b>
-    {% if j.get("started") %} · inicio: {{ j["started"] }} {% endif %}
-    {% if j.get("ended") %} · fin: {{ j["ended"] }} {% endif %}
-    · <a href="{{ url_for('job_json', job=job) }}" target="_blank">Ver JSON</a>
-    · <a href="{{ url_for('job_csv', job=job) }}" target="_blank">Descargar CSV</a>
-  </p>
+  <h3 style="margin:0 0 12px 0;">Job {job_id}</h3>
 
-  {% if j["status"] != "done" %}
-    <p class="muted">Actualiza en unos segundos…</p>
-    <script> setTimeout(function(){ location.reload(); }, 4000); </script>
-  {% elif j.get("error") %}
-    <pre>{{ j["error"] }}</pre>
-  {% else %}
-    <h4>Top {{ rows|length }}</h4>
-    <table>
-      <thead>
-        <tr>
-          <th>symbol</th><th>price</th><th>% 24h</th><th>quote volume 24h</th>
-          <th>Trend 4H</th><th>ScoreTrend</th><th>fundingRate</th>
-          <th>openInterest</th><th>oi_delta</th><th>NetScore</th><th>GHI</th>
-        </tr>
-      </thead>
-      <tbody>
-      {% for r in rows %}
-        <tr>
-          <td style="text-align:left">{{ r.get("symbol","") }}</td>
-          <td>{{ "%.6g"|format(r.get("price") or 0) }}</td>
-          <td>{{ "%.3f"|format(100*(r.get("pct_change_24h") or 0)) }}%</td>
-          <td>{{ "{:,.0f}".format(r.get("quote_volume_24h") or 0) }}</td>
-          <td>{{ r.get("Trend_4H") or "-" }}</td>
-          <td>{{ "%.3f"|format(r.get("ScoreTrend") or 0) }}</td>
-          <td>{{ ("%.6f"%r.get("fundingRate")).rstrip('0').rstrip('.') if r.get("fundingRate") is not none else "-" }}</td>
-          <td>{{ "{:,.0f}".format(r.get("openInterest") or 0) if r.get("openInterest") is not none else "-" }}</td>
-          <td>{{ "{:,.0f}".format(r.get("oi_delta") or 0) if r.get("oi_delta") is not none else "-" }}</td>
-          <td>{{ "%.2f"|format(r.get("NetScore") or 0) }}</td>
-          <td>{{ "%.3f"|format(r.get("GHI") or 0) }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  {% endif %}
-</body>
-</html>
-"""
-    rows = j.get("rows") or []
-    return render_template_string(tpl, job=job, j=j, rows=rows)
+  <div id="status" class="row muted">Cargando estado...</div>
+  <div class="row tiny muted">Actualiza en unos segundos...</div>
+  <div id="links" class="row" style="margin-top:12px;"></div>
 
+  <script>
+    const jobId = {json.dumps(job_id)};
+    const st    = document.getElementById('status');
+    const links = document.getElementById('links');
 
-@app.get("/api")
-def job_json():
-    job = request.args.get("job")
-    j = read_json(job_path(job)) if job else None
-    if not j:
-        return Response(json.dumps({"status": "not_found"}), status=404, mimetype="application/json")
-    return Response(json.dumps(j, ensure_ascii=False), mimetype="application/json")
+    function fmt(d) {{
+      if (!d) return '—';
+      return d;
+    }}
 
+    function render(data) {{
+      let badge = '<span class="pill">' + data.status + '</span>';
+      if (data.status === 'done')  badge = '<span class="pill ok">ok</span>';
+      if (data.status === 'error') badge = '<span class="pill err">error</span>';
 
-@app.get("/csv")
-def job_csv():
-    """Devuelve el CSV del job si existe; de lo contrario 404/202 según estado."""
-    job = request.args.get("job")
-    j = read_json(job_path(job)) if job else None
-    if not j:
-        return "Job not found", 404
-    if j.get("status") != "done":
-        return "Job still running", 202
-
-    csv_path = j.get("csv_path")
-    if csv_path and Path(csv_path).exists():
-        return send_file(csv_path, mimetype="text/csv", as_attachment=True,
-                         download_name=f"usdt_screener_{job}.csv")
-
-    # fallback: arme CSV desde las filas guardadas
-    rows = j.get("rows") or []
-    if not rows:
-        return "No data", 204
-    df = pd.DataFrame(rows)
-    cols = ["symbol","price","pct_change_24h","quote_volume_24h",
-            "Trend_4H","ScoreTrend","fundingRate","openInterest",
-            "oi_delta","NetScore","GHI"]
-    cols = [c for c in cols if c in df.columns]
-    df = df[cols]
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return Response(
-        buf.getvalue().encode("utf-8"),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=usdt_screener_{job}.csv"}
-    )
-
-
-@app.get("/csv_tmp")
-def csv_tmp():
-    """Sirve el CSV global que el motor escriba en /tmp/usdt_screener.csv (si existe)."""
-    if not CSV_GLOBAL.exists():
-        return "El archivo /tmp/usdt_screener.csv no existe", 404
-    return send_file(str(CSV_GLOBAL), mimetype="text/csv",
-                     as_attachment=True, download_name="usdt_screener.csv")
-
-
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
-
-
-if __name__ == "__main__":
-    # Para pruebas locales: FLASK_DEBUG=1 python app.py
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)
+      st.innerHTML = `
+        <div class="row">Estado: ${badge}
+          · inicio: ${fmt(data.started)} · fin: ${fmt(data.ended || '')}
+          · <a href="/api?job=${jobId}" target="_blank">Ver JSON</a>
