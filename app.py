@@ -10,14 +10,20 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, make_response
-from python_decouple import config
+
+# --- decouple (con fallback a os.environ) ---
+try:
+    from decouple import config  # pip install python-decouple
+except Exception:  # si no está instalado, leer desde el entorno
+    def config(key: str, default: Optional[str] = None) -> str:
+        return os.environ.get(key, default or "")
 
 # ---------------------------
 # Config
 # ---------------------------
 LIMIT_SYMBOLS = int(config("LIMIT_SYMBOLS", default="150"))
-MAX_WORKERS = int(config("MAX_WORKERS", default="12"))
-BUDGET_SEC = int(config("BUDGET", default="110"))
+MAX_WORKERS   = int(config("MAX_WORKERS", default="12"))
+BUDGET_SEC    = int(config("BUDGET",        default="110"))
 
 CSV_TMP_PATH = Path("/tmp/usdt_screener.csv")
 JOBS_DIR = Path("/tmp/usd_jobs")
@@ -44,7 +50,6 @@ def save_job(job_id: str, meta: Dict[str, Any]) -> None:
     p = job_json_path(job_id)
     with p.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
-    # Evitar caching de proxies
     p.touch()
 
 def read_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -61,7 +66,6 @@ def gen_job_id() -> str:
     return uuid.uuid4().hex[:10]
 
 def wait_for_file(path: Path, timeout: float = 12.0, poll: float = 0.25) -> bool:
-    """Espera hasta 'timeout' a que 'path' exista y tenga tamaño > 0."""
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
         try:
@@ -143,17 +147,14 @@ def background_job(job_id: str):
     save_job(job_id, meta)
 
     try:
-        # Ejecuta el motor
         call_engine_and_wait()
 
-        # Espera a que /tmp/usdt_screener.csv aparezca
+        # Espera CSV
         csv_ready = CSV_TMP_PATH.exists() and wait_for_file(CSV_TMP_PATH, timeout=12.0, poll=0.25)
-
         src_csv = None
         if csv_ready:
             src_csv = CSV_TMP_PATH
         else:
-            # Buscar cualquier *.csv reciente en /tmp (fallback)
             for cand in sorted(Path("/tmp").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
                 if wait_for_file(cand, timeout=2.0, poll=0.2):
                     src_csv = cand
@@ -162,11 +163,9 @@ def background_job(job_id: str):
         if not src_csv:
             raise RuntimeError("El motor no produjo un CSV en /tmp (usdt_screener.csv u otro *.csv).")
 
-        # Copiar al CSV del job
         dest = job_csv_path(job_id)
         shutil.copyfile(src_csv, dest)
 
-        # Contar filas
         count_rows = 0
         try:
             import pandas as pd  # noqa
@@ -201,7 +200,7 @@ def background_job(job_id: str):
         print(f"❌ Job {job_id} error: {e}")
 
 # ---------------------------
-# HTML (sin f-strings: JS toma ?job= de la URL)
+# HTML (no f-strings)
 # ---------------------------
 VIEW_HTML = """<!doctype html>
 <html lang="es">
@@ -305,7 +304,6 @@ def no_cache(resp: Response):
 
 @app.get("/")
 def index():
-    # Crea un job nuevo y redirige a /view
     job_id = gen_job_id()
     t = threading.Thread(target=background_job, args=(job_id,), daemon=True)
     t.start()
@@ -313,7 +311,6 @@ def index():
 
 @app.get("/view")
 def view():
-    # HTML plano (no f-string) que lee ?job=... desde el propio JS
     resp = make_response(VIEW_HTML, 200)
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
@@ -335,7 +332,6 @@ def csv_for_job():
         return Response("job requerido", status=400)
     p = job_csv_path(job_id)
     if not p.exists():
-        # Aún procesando
         return Response("CSV aún no disponible", status=202)
     return send_file(
         str(p),
@@ -350,7 +346,6 @@ def csv_for_job():
 
 @app.get("/csv_tmp")
 def csv_tmp():
-    # Sirve el CSV global en /tmp si existe (o el *.csv más reciente)
     if CSV_TMP_PATH.exists() and CSV_TMP_PATH.stat().st_size > 0:
         p = CSV_TMP_PATH
     else:
@@ -369,9 +364,5 @@ def csv_tmp():
         last_modified=None,
     )
 
-# ---------------------------
-# WSGI (para gunicorn)
-# ---------------------------
 if __name__ == "__main__":
-    # Útil en local
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True, threaded=True)
