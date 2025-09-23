@@ -4,86 +4,143 @@ import os
 import json
 import uuid
 import threading
+from pathlib import Path
 from datetime import datetime, timezone
 
 import pandas as pd
-from flask import Flask, request, Response, send_file, render_template_string, redirect, url_for
+from flask import (
+    Flask, request, Response, send_file,
+    render_template_string, redirect, url_for
+)
 
-# ---- importa el motor ligero para Render ----
-import Binance_usdt_2 as engine  # asegúrate que el nombre del archivo coincide
+# Motor de cálculo (ligero para Render)
+import Binance_usdt_2 as engine  # asegura el nombre correcto del archivo
 
-# ===================== Flask app =====================
+# =================== Config ===================
 app = Flask(__name__)
 
-# Memoria en proceso para jobs efímeros
-JOBS = {}  # job_id -> dict(status, started, ended, rows, raw_rows, info)
+TOP_N = int(os.environ.get("TOP_N", "100"))  # filas a mostrar
+JOBS_DIR = Path("/tmp/jobs")
+JOBS_DIR.mkdir(parents=True, exist_ok=True)  # storage compartido entre workers
+CSV_GLOBAL = Path("/tmp/usdt_screener.csv")  # si el motor lo guarda aquí
 
-# Parámetros de presentación
-TOP_N = int(os.environ.get("TOP_N", "100"))
-
-# ===================== Helpers =====================
-def _now_utc_str():
+# =================== Utilidades ===================
+def now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _rows_from_df(df: pd.DataFrame, top_n: int) -> list[dict]:
-    """Devuelve filas simples (tipos JSON-friendly)."""
+def job_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def write_json_atomic(path: Path, payload: dict):
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)  # atómico en el mismo filesystem
+
+
+def read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def rows_from_df(df: pd.DataFrame, top_n: int) -> list[dict]:
     cols_pref = [
         "symbol", "price", "pct_change_24h", "quote_volume_24h",
-        "Trend_4H", "ScoreTrend", "fundingRate", "openInterest",
-        "oi_delta", "NetScore", "GHI"
+        "Trend_4H", "ScoreTrend", "fundingRate",
+        "openInterest", "oi_delta", "NetScore", "GHI"
     ]
     cols = [c for c in cols_pref if c in df.columns]
     slim = df[cols].head(top_n).copy()
-    # convierte NaN -> None para JSON limpio
+
     out = []
     for _, r in slim.iterrows():
-        d = {k: (None if pd.isna(v) else (float(v) if isinstance(v, (int, float)) else v)) for k, v in r.to_dict().items()}
+        d = {}
+        for k, v in r.items():
+            if pd.isna(v):
+                d[k] = None
+            elif isinstance(v, (int, float)):
+                d[k] = float(v)
+            else:
+                d[k] = v
         out.append(d)
     return out
 
 
-def _start_job(job_id: str):
-    """Hilo que ejecuta el cálculo y guarda resultados en JOBS."""
+def _run_job(job_id: str):
+    """Ejecuta el motor en un hilo, guarda JSON y CSV de ese job."""
+    jp = job_path(job_id)
+    payload = {"job": job_id, "status": "running", "started": now_utc()}
+    write_json_atomic(jp, payload)
+
     try:
-        df, info = engine.build_df()  # respeta LIMIT_SYMBOLS/MAX_WORKERS/BUDGET desde ENV
-        rows = _rows_from_df(df, TOP_N) if df is not None and not df.empty else []
-        JOBS[job_id].update({
+        # Ejecuta motor: debe devolver (DataFrame, info_dict)
+        df, info = engine.build_df()  # respeta LIMIT_SYMBOLS/MAX_WORKERS/BUDGET via ENV
+
+        if df is None or df.empty:
+            payload.update({
+                "status": "error",
+                "ended": now_utc(),
+                "error": "No data returned by engine",
+            })
+            write_json_atomic(jp, payload)
+            return
+
+        # Guardamos CSV específico por job
+        csv_job = JOBS_DIR / f"usdt_screener_{job_id}.csv"
+        try:
+            df.to_csv(csv_job, index=False)
+        except Exception:
+            # backup: generar CSV solo con columnas visibles
+            rows = rows_from_df(df, len(df))
+            pd.DataFrame(rows).to_csv(csv_job, index=False)
+
+        rows = rows_from_df(df, TOP_N)
+
+        payload.update({
             "status": "done",
-            "ended": _now_utc_str(),
+            "ended": now_utc(),
             "rows": rows,
-            "raw_rows": rows,   # mantenemos las mismas filas para CSV estable
             "info": info or {},
+            "csv_path": str(csv_job),
         })
+        write_json_atomic(jp, payload)
+
     except Exception as e:
-        JOBS[job_id].update({
+        payload.update({
             "status": "error",
-            "ended": _now_utc_str(),
+            "ended": now_utc(),
             "error": str(e),
         })
+        write_json_atomic(jp, payload)
 
-
-# ===================== Rutas =====================
+# =================== Rutas ===================
 
 @app.get("/")
 def home():
-    """Lanza un job y redirige a la vista con auto-refresh."""
+    """Lanza un job y redirige a /view?job=..."""
     job_id = uuid.uuid4().hex[:10]
-    JOBS[job_id] = {"status": "running", "started": _now_utc_str()}
-    t = threading.Thread(target=_start_job, args=(job_id,), daemon=True)
+    # crea archivo de estado antes de lanzar el hilo (visible a todos los workers)
+    write_json_atomic(job_path(job_id), {
+        "job": job_id, "status": "running", "started": now_utc()
+    })
+    t = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
     t.start()
     return redirect(url_for("view_job", job=job_id))
 
 
 @app.get("/view")
 def view_job():
-    """HTML simple con auto-refresh; muestra tabla cuando termina."""
     job = request.args.get("job")
-    j = JOBS.get(job)
+    jp = job_path(job) if job else None
+    j = read_json(jp) if jp else None
     if not j:
         return "Job not found", 404
 
-    # Pequeña plantilla inline para evitar archivos estáticos
     tpl = """
 <!doctype html>
 <html>
@@ -105,15 +162,13 @@ def view_job():
     Estado: <b>{{ j["status"] }}</b>
     {% if j.get("started") %} · inicio: {{ j["started"] }} {% endif %}
     {% if j.get("ended") %} · fin: {{ j["ended"] }} {% endif %}
-    · <a id="jsonlink" href="{{ url_for('job_json', job=job) }}" target="_blank">Ver JSON</a>
-    · <a id="csvlink" href="{{ url_for('job_csv', job=job) }}" target="_blank">Descargar CSV</a>
+    · <a href="{{ url_for('job_json', job=job) }}" target="_blank">Ver JSON</a>
+    · <a href="{{ url_for('job_csv', job=job) }}" target="_blank">Descargar CSV</a>
   </p>
 
   {% if j["status"] != "done" %}
     <p class="muted">Actualiza en unos segundos…</p>
-    <script>
-      setTimeout(function(){ location.reload(); }, 4000);
-    </script>
+    <script> setTimeout(function(){ location.reload(); }, 4000); </script>
   {% elif j.get("error") %}
     <pre>{{ j["error"] }}</pre>
   {% else %}
@@ -121,17 +176,9 @@ def view_job():
     <table>
       <thead>
         <tr>
-          <th>symbol</th>
-          <th>price</th>
-          <th>% 24h</th>
-          <th>quote volume 24h</th>
-          <th>Trend 4H</th>
-          <th>ScoreTrend</th>
-          <th>fundingRate</th>
-          <th>openInterest</th>
-          <th>oi_delta</th>
-          <th>NetScore</th>
-          <th>GHI</th>
+          <th>symbol</th><th>price</th><th>% 24h</th><th>quote volume 24h</th>
+          <th>Trend 4H</th><th>ScoreTrend</th><th>fundingRate</th>
+          <th>openInterest</th><th>oi_delta</th><th>NetScore</th><th>GHI</th>
         </tr>
       </thead>
       <tbody>
@@ -155,56 +202,49 @@ def view_job():
   {% endif %}
 </body>
 </html>
-    """
+"""
     rows = j.get("rows") or []
     return render_template_string(tpl, job=job, j=j, rows=rows)
 
 
 @app.get("/api")
 def job_json():
-    """Devuelve el resultado del job en JSON."""
     job = request.args.get("job")
-    j = JOBS.get(job)
+    j = read_json(job_path(job)) if job else None
     if not j:
         return Response(json.dumps({"status": "not_found"}), status=404, mimetype="application/json")
-    payload = {
-        "job": job,
-        "status": j.get("status"),
-        "started": j.get("started"),
-        "ended": j.get("ended"),
-        "rows": j.get("rows") or [],
-        "info": j.get("info") or {},
-        "error": j.get("error"),
-    }
-    return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
+    return Response(json.dumps(j, ensure_ascii=False), mimetype="application/json")
 
 
 @app.get("/csv")
 def job_csv():
-    """Genera un CSV directamente desde el resultado del job (estable)."""
+    """Devuelve el CSV del job si existe; de lo contrario 404/202 según estado."""
     job = request.args.get("job")
-    j = JOBS.get(job)
+    j = read_json(job_path(job)) if job else None
     if not j:
         return "Job not found", 404
-    if j["status"] != "done":
+    if j.get("status") != "done":
         return "Job still running", 202
 
-    rows = j.get("raw_rows") or []
+    csv_path = j.get("csv_path")
+    if csv_path and Path(csv_path).exists():
+        return send_file(csv_path, mimetype="text/csv", as_attachment=True,
+                         download_name=f"usdt_screener_{job}.csv")
+
+    # fallback: arme CSV desde las filas guardadas
+    rows = j.get("rows") or []
     if not rows:
         return "No data", 204
-
     df = pd.DataFrame(rows)
     cols = ["symbol","price","pct_change_24h","quote_volume_24h",
             "Trend_4H","ScoreTrend","fundingRate","openInterest",
             "oi_delta","NetScore","GHI"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols]
-
     buf = io.StringIO()
     df.to_csv(buf, index=False)
-    csv_bytes = buf.getvalue().encode("utf-8")
     return Response(
-        csv_bytes,
+        buf.getvalue().encode("utf-8"),
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename=usdt_screener_{job}.csv"}
     )
@@ -212,26 +252,18 @@ def job_csv():
 
 @app.get("/csv_tmp")
 def csv_tmp():
-    """Sirve el archivo temporal /tmp/usdt_screener.csv si existe."""
-    from pathlib import Path
-    p = Path("/tmp/usdt_screener.csv")
-    if not p.exists():
+    """Sirve el CSV global que el motor escriba en /tmp/usdt_screener.csv (si existe)."""
+    if not CSV_GLOBAL.exists():
         return "El archivo /tmp/usdt_screener.csv no existe", 404
-    return send_file(
-        str(p),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="usdt_screener.csv",
-    )
+    return send_file(str(CSV_GLOBAL), mimetype="text/csv",
+                     as_attachment=True, download_name="usdt_screener.csv")
 
 
-# Salud
 @app.get("/healthz")
 def healthz():
     return "ok", 200
 
 
-# ============== main (local) ==============
 if __name__ == "__main__":
-    # Para probar local: FLASK_DEBUG=1 python app.py
+    # Para pruebas locales: FLASK_DEBUG=1 python app.py
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)
