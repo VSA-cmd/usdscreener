@@ -1,41 +1,44 @@
 # app.py
 import os
+import sys
 import json
 import time
 import uuid
 import shutil
 import threading
+import subprocess
+import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Any, Optional
 
 from flask import Flask, redirect, request, jsonify, send_file, url_for, Response, make_response
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Configuración
+# Config
 # ────────────────────────────────────────────────────────────────────────────────
 LIMIT_SYMBOLS = int(os.getenv("LIMIT_SYMBOLS", "150"))
 MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "12"))
-BUDGET_SEC    = int(os.getenv("BUDGET", "110"))  # segundos
+BUDGET_SEC    = int(os.getenv("BUDGET", "110"))
 
-CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")   # donde el motor guarda siempre
-JOBS_DIR      = Path("/tmp/jobs")                # persistimos estado por job
+CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")
+JOBS_DIR      = Path("/tmp/jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+ENGINE_CANDIDATES = ["Binance_usdt_2", "Binance_usdt"]
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Carga del motor (soportamos ambos nombres)
+# Carga de motor (no obligatorio para fallback)
 # ────────────────────────────────────────────────────────────────────────────────
 engine = None
-engine_name = None
-try:
-    import Binance_usdt_2 as engine  # type: ignore
-    engine_name = "Binance_usdt_2"
-except Exception:
+engine_name: Optional[str] = None
+for mod in ENGINE_CANDIDATES:
     try:
-        import Binance_usdt as engine  # type: ignore
-        engine_name = "Binance_usdt"
+        engine = __import__(mod)
+        engine_name = mod
+        break
     except Exception:
-        engine = None
-        engine_name = None
+        continue
 
 # ────────────────────────────────────────────────────────────────────────────────
 # App
@@ -43,7 +46,7 @@ except Exception:
 app = Flask(__name__)
 
 JOBS_LOCK = threading.Lock()
-JOBS = {}  # job_id -> dict
+JOBS: Dict[str, Dict[str, Any]] = {}
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -54,14 +57,14 @@ def job_json_path(job_id: str) -> Path:
 def job_csv_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.csv"
 
-def save_job(job_id: str, payload: dict) -> None:
+def save_job(job_id: str, payload: Dict[str, Any]) -> None:
     payload["_engine"] = engine_name
     payload["_updated_utc"] = now_utc_iso()
     job_json_path(job_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     with JOBS_LOCK:
         JOBS[job_id] = payload
 
-def load_job(job_id: str) -> dict | None:
+def load_job(job_id: str) -> Optional[Dict[str, Any]]:
     p = job_json_path(job_id)
     if p.exists():
         try:
@@ -74,44 +77,156 @@ def load_job(job_id: str) -> dict | None:
     with JOBS_LOCK:
         return JOBS.get(job_id)
 
-def call_engine_and_wait():
+# ────────────────────────────────────────────────────────────────────────────────
+# Ejecución del motor
+# ────────────────────────────────────────────────────────────────────────────────
+def _call_engine_by_reflection() -> None:
     """
-    Ejecuta la función principal del motor y deja el CSV en CSV_TMP_PATH.
+    Intenta invocar funciones típicas si el módulo se importa.
+    Si ninguna está presente, lanza RuntimeError para que el caller haga fallback.
     """
     if engine is None:
         raise RuntimeError("No se pudo importar el motor (Binance_usdt_2 / Binance_usdt).")
 
+    import inspect
+
     tried = []
+    preferred = [
+        "run_screener", "run", "main", "screener", "start", "execute",
+    ]
+    # También descubrimos funciones que contengan estas palabras
+    dynamic = []
+    for name in dir(engine):
+        if name.startswith("_"):
+            continue
+        obj = getattr(engine, name)
+        if callable(obj) and any(k in name.lower() for k in ("run", "main", "screener", "start", "exec")):
+            dynamic.append(name)
 
-    if hasattr(engine, "run_screener"):
-        tried.append("run_screener")
-        return engine.run_screener(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+    candidates = []
+    # mantén orden y unicidad
+    for n in preferred + dynamic:
+        if n not in candidates and hasattr(engine, n) and callable(getattr(engine, n)):
+            candidates.append(n)
 
-    if hasattr(engine, "run"):
-        tried.append("run")
-        return engine.run(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
+    if not candidates:
+        raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
 
-    if hasattr(engine, "main"):
-        tried.append("main")
+    # intentamos pasar sólo los kwargs aceptados por la firma
+    KW = {
+        "LIMIT_SYMBOLS": LIMIT_SYMBOLS,
+        "MAX_WORKERS": MAX_WORKERS,
+        "BUDGET": BUDGET_SEC,
+        # variantes en minúsculas por si las usan
+        "limit_symbols": LIMIT_SYMBOLS,
+        "max_workers": MAX_WORKERS,
+        "budget": BUDGET_SEC,
+    }
+
+    last_err = None
+    for name in candidates:
+        fn = getattr(engine, name)
+        tried.append(name)
         try:
-            return engine.main(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
-        except TypeError:
-            return engine.main()  # type: ignore
+            sig = inspect.signature(fn)
+            kwargs = {}
+            for p in sig.parameters.values():
+                if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL):
+                    continue
+                if p.name in KW:
+                    kwargs[p.name] = KW[p.name]
+            # preferimos kwargs; si ninguno coincide, llamamos sin args
+            if kwargs:
+                fn(**kwargs)  # type: ignore
+            else:
+                fn()  # type: ignore
+            return
+        except Exception as e:
+            last_err = e
+            continue
 
-    for fname in ("screener", "start", "execute"):
-        if hasattr(engine, fname):
-            tried.append(fname)
-            fn = getattr(engine, fname)
-            try:
-                return fn(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)  # type: ignore
-            except TypeError:
-                return fn()  # type: ignore
+    raise RuntimeError(
+        f"No pude ejecutar ninguna función del motor. Intentos={tried}. Último error: {last_err}"
+    )
 
-    raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
+def _call_engine_as_script() -> None:
+    """
+    Ejecuta el motor como script con subprocess y espera a que termine.
+    Prioriza `python -m Binance_usdt_2` y `python Binance_usdt_2.py`.
+    Propaga LIMIT_SYMBOLS/MAX_WORKERS/BUDGET por variables de entorno.
+    """
+    env = os.environ.copy()
+    env.update({
+        "LIMIT_SYMBOLS": str(LIMIT_SYMBOLS),
+        "MAX_WORKERS": str(MAX_WORKERS),
+        "BUDGET": str(BUDGET_SEC),
+        "PYTHONUNBUFFERED": "1",
+    })
 
+    cmd_variants = []
+
+    # Si conocemos el nombre importable, primero prueba como módulo
+    if engine_name:
+        cmd_variants.append([sys.executable, "-u", "-m", engine_name])
+
+    # Después probamos posibles rutas de archivo
+    project_dir = Path(__file__).resolve().parent
+    for base in ENGINE_CANDIDATES:
+        py = project_dir / f"{base}.py"
+        if py.exists():
+            cmd_variants.append([sys.executable, "-u", str(py)])
+
+    if not cmd_variants:
+        raise RuntimeError("No encontré archivos del motor (Binance_usdt_2.py / Binance_usdt.py) en el proyecto.")
+
+    last_rc = None
+    last_out = None
+    last_err = None
+
+    for cmd in cmd_variants:
+        try:
+            print(f"→ Ejecutando motor como script: {' '.join(cmd)}")
+            cp = subprocess.run(
+                cmd,
+                env=env,
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=max(BUDGET_SEC + 90, 180),   # margen de seguridad
+            )
+            last_rc, last_out, last_err = cp.returncode, cp.stdout, cp.stderr
+            print(last_out or "", end="")
+            if last_err:
+                print(last_err, file=sys.stderr, end="")
+            if cp.returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("El motor excedió el tiempo máximo de ejecución (timeout).")
+
+    raise RuntimeError(f"El motor terminó con código {last_rc}. STDERR: {last_err}")
+
+def call_engine_and_wait() -> None:
+    """
+    Deja el CSV en /tmp/usdt_screener.csv (o donde el motor lo genere).
+    Intenta reflexión; si no, fallback a script.
+    """
+    # 1) Intento por reflexión si el import funcionó
+    if engine is not None:
+        try:
+            _call_engine_by_reflection()
+        except RuntimeError:
+            # Si falla por “no hay funciones”, probamos como script
+            _call_engine_as_script()
+    else:
+        # Si no se pudo importar, vamos directo a script
+        _call_engine_as_script()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Job runner
+# ────────────────────────────────────────────────────────────────────────────────
 def background_job(job_id: str):
     started = time.perf_counter()
-    meta = {
+    meta: Dict[str, Any] = {
         "job": job_id,
         "status": "running",
         "started": now_utc_iso(),
@@ -124,10 +239,17 @@ def background_job(job_id: str):
     try:
         call_engine_and_wait()
 
+        # Copiamos CSV global (si existe) a la carpeta del job
         if CSV_TMP_PATH.exists():
             shutil.copyfile(CSV_TMP_PATH, job_csv_path(job_id))
         else:
-            print("⚠️  El motor terminó pero no encontré /tmp/usdt_screener.csv")
+            # si el motor escribe en otro nombre, intenta detectarlo en /tmp
+            for cand in Path("/tmp").glob("*.csv"):
+                try:
+                    shutil.copyfile(cand, job_csv_path(job_id))
+                    break
+                except Exception:
+                    pass
 
         rows = []
         if job_csv_path(job_id).exists():
@@ -306,7 +428,6 @@ def job_csv():
 
 @app.get("/csv_tmp")
 def csv_tmp():
-    """Descarga directa del último CSV que dejó el motor."""
     if not CSV_TMP_PATH.exists():
         return Response("No existe /tmp/usdt_screener.csv aún.", 404, mimetype="text/plain")
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
