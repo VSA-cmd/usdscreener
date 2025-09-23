@@ -1,161 +1,183 @@
+# -*- coding: utf-8 -*-
 import os
-import json
-import threading
-import subprocess
+import uuid
 import time
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+from flask import Flask, request, jsonify, redirect, url_for, render_template_string
+
+import pandas as pd
+
+# Motor
+import Binance_usdt_2 as engine
 
 app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=2)
+JOBS = {}  # job_id -> dict(status, started, ended, df, log)
 
-JOBS = {}  # job_id -> {"status": "...", "started": ts, "df_json": None, "log": []}
-
-HOME_HTML = """
+HTML = """
 <!doctype html>
-<title>USDT Screener</title>
-<div style="font-family:system-ui, Segoe UI, Arial; max-width: 980px; margin: 32px auto;">
-  <h1>USDT Screener</h1>
-  <p>Free tier: la primera petición puede tardar un poco en “despertar”.</p>
-  <form action="{{ url_for('start') }}" method="get">
-    <button style="padding:10px 16px; font-size:16px;">Run screener</button>
-  </form>
-</div>
-"""
-
-VIEW_HTML = """
-<!doctype html>
-<title>USDT Screener</title>
-<div style="font-family:system-ui, Segoe UI, Arial; max-width: 1100px; margin: 28px auto;">
-  <h2>Job {{ job_id }}</h2>
-  {% if status == "running" %}
-    <p><b>Status:</b> {{ status }} — Esta página se recarga cada 3s…</p>
-    <form action="" method="get"><button>Refresh</button></form>
-    <details style="margin-top:12px;"><summary>Ver JSON</summary><pre>{{ job_state|tojson(indent=2) }}</pre></details>
-    <script>setTimeout(()=>location.reload(), 3000);</script>
-  {% elif status == "done" %}
-    <p><b>Status:</b> {{ status }}</p>
-    <details style="margin-top:12px;"><summary>Ver JSON</summary><pre>{{ job_state|tojson(indent=2) }}</pre></details>
-    {% if df and (df|length) > 0 %}
-      <hr/>
-      <h3>Top 100</h3>
-      <table border="1" cellspacing="0" cellpadding="6">
-        <thead>
-          <tr>
-            <th>symbol</th><th>price</th><th>pct_change_24h</th>
-            <th>quote_volume_24h</th><th>Trend_4H</th><th>ScoreTrend</th>
-            <th>fundingRate</th><th>openInterest</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in df %}
-          <tr>
-            <td>{{ row.symbol }}</td>
-            <td>{{ "%.4f"|format(row.price|float) if row.price is not none else "" }}</td>
-            <td>{{ "%.4f%%"|format(row.pct_change_24h*100) if row.pct_change_24h is not none else "" }}</td>
-            <td>{{ "{:,.0f}".format(row.quote_volume_24h) if row.quote_volume_24h is not none else "" }}</td>
-            <td>{{ row.Trend_4H or "" }}</td>
-            <td>{{ "%.3f"|format(row.ScoreTrend) if row.ScoreTrend is not none else "" }}</td>
-            <td>{{ ("%.5f%%"|format(row.fundingRate*100)) if row.fundingRate is not none else "" }}</td>
-            <td>{{ "{:,.0f}".format(row.openInterest) if row.openInterest is not none else "" }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p>No llegó DataFrame (o llegó vacío). Revisa el log debajo.</p>
-    {% endif %}
-    <hr/><h3>Log</h3>
-    <pre style="background:#111;color:#0f0;padding:12px; white-space:pre-wrap; max-height:320px; overflow:auto;">
-{{ log_txt }}
-    </pre>
-    <p><a href="{{ url_for('home') }}">Home</a></p>
-  {% else %}
-    <h3>Error</h3>
-    <pre style="background:#111;color:#f66;padding:12px;">{{ err_msg }}</pre>
-    <p><a href="{{ url_for('home') }}">Run again</a></p>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding:18px; color:#111;}
+    table{border-collapse:collapse; width:100%; font-size:14px}
+    th,td{border:1px solid #ddd; padding:6px 8px; text-align:right;}
+    th{background:#f6f6f6; position:sticky; top:0}
+    td:first-child, th:first-child{text-align:left}
+    .tag{display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px}
+    .ok{background:#e8fff0; color:#126f3d}
+    .warn{background:#fff6e0; color:#7a6200}
+    .err{background:#ffefef; color:#9c1a1a}
+    .muted{color:#777}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px}
+    .toolbar{margin-bottom:10px}
+  </style>
+</head>
+<body>
+  <h2>{{ title }}</h2>
+  {% if job %}
+    <div class="toolbar">
+      Job <span class="mono">{{ job }}</span> ·
+      Estado: 
+      {% if status == 'done' %}
+        <span class="tag ok">done</span>
+      {% elif status == 'running' %}
+        <span class="tag warn">running</span>
+      {% else %}
+        <span class="tag err">{{ status }}</span>
+      {% endif %}
+      {% if started %} · Inicio: {{ started }}{% endif %}
+      {% if ended %} · Fin: {{ ended }}{% endif %}
+      · <a href="{{ url_for('job_json', job=job) }}">Ver JSON</a>
+    </div>
   {% endif %}
-</div>
+
+  {% if status != 'done' %}
+    <p class="muted">Actualiza en unos segundos…</p>
+  {% else %}
+    <h3>Top {{ df.shape[0] }}</h3>
+    <table>
+      <thead>
+        <tr>
+          {% for c in columns %}
+            <th>{{ c }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for _, row in df.iterrows() %}
+          <tr>
+            {% for c in columns %}
+              <td>{{ row[c] }}</td>
+            {% endfor %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if log %}
+      <h3>Log</h3>
+      <pre class="mono">{{ log }}</pre>
+    {% endif %}
+  {% endif %}
+</body>
+</html>
 """
 
-def _append_log(job_id: str, line: str):
-    if not line:
-        return
-    # corte seguro a 400 chars como slice
-    JOBS[job_id]["log"].append(line[-400:])
+def run_job(job_id: str, limit: int):
+    log = []
+    def logp(msg):
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        m = f"{ts} {msg}"
+        print(m)
+        log.append(m)
 
-def _run_pipeline_and_load_df(job_id: str, timeout_sec: int = 240):
-    """
-    Ejecuta Binance_usdt_2.py y extrae el DataFrame desde stdout buscando la marca __DFJSON__=
-    """
-    cmd = ["python", "Binance_usdt_2.py"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-
-    df_json = None
     try:
-        t0 = time.time()
-        for line in proc.stdout:
-            _append_log(job_id, line.rstrip("\n"))
-            if "__DFJSON__=" in line:
-                try:
-                    payload = line.split("__DFJSON__=", 1)[1].strip()
-                    df_json = json.loads(payload)
-                except Exception as e:
-                    _append_log(job_id, f"[parse-error] {repr(e)}")
-            if time.time() - t0 > timeout_sec:
-                proc.kill()
-                raise TimeoutError(f"TimeoutExpired({cmd}, {timeout_sec})")
-        rc = proc.wait(timeout=5)
-        if rc != 0:
-            _append_log(job_id, f"[exit-code] {rc}")
-    except Exception as e:
-        _append_log(job_id, f"[error] {repr(e)}")
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["started"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        df, info = engine.build_df(limit_symbols=limit, logger=logp)
 
-    return df_json
+        # Selección de columnas “web-friendly”
+        cols = [
+            "symbol", "price", "pct_change_24h", "quote_volume_24h",
+            "Trend_4H", "ScoreTrend", "fundingRate", "openInterest",
+            "oi_delta", "NetScore", "GHI"
+        ]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
 
-def _job_runner(job_id: str):
-    JOBS[job_id]["status"] = "running"
-    try:
-        df = _run_pipeline_and_load_df(job_id)
-        JOBS[job_id]["df_json"] = df or []
+        # Formatos
+        fmt = df.copy()
+        fmt["price"] = fmt["price"].map(lambda v: f"{v:.8f}" if pd.notna(v) else "-")
+        fmt["pct_change_24h"] = (fmt["pct_change_24h"]*100).map(lambda v: f"{v:.3f}%" if pd.notna(v) else "-")
+        fmt["quote_volume_24h"] = fmt["quote_volume_24h"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        fmt["ScoreTrend"] = fmt["ScoreTrend"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "-")
+        fmt["fundingRate"] = (fmt["fundingRate"]*100).map(lambda v: f"{v:.4f}%" if pd.notna(v) else "-")
+        fmt["openInterest"] = fmt["openInterest"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        fmt["oi_delta"] = fmt["oi_delta"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        fmt["NetScore"] = fmt["NetScore"].map(lambda v: f"{v:+.2f}" if pd.notna(v) else "-")
+        fmt["GHI"] = fmt["GHI"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "-")
+
+        JOBS[job_id]["df"] = fmt[cols]
+        JOBS[job_id]["raw"] = df
         JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["ended"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        JOBS[job_id]["log"] = "\n".join(log)
     except Exception as e:
-        _append_log(job_id, f"[error-final] {repr(e)}")
-        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["status"] = f"error: {e}"
+        JOBS[job_id]["ended"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        JOBS[job_id]["log"] = "\n".join(log) + f"\nERROR: {e}"
 
-@app.route("/")
-def home():
-    return render_template_string(HOME_HTML)
+@app.get("/")
+def index():
+    # arranca un job y redirige a /view
+    limit = int(request.args.get("limit") or os.environ.get("LIMIT_SYMBOLS", "150"))
+    job = uuid.uuid4().hex[:10]
+    JOBS[job] = {"status":"queued", "started":None, "ended":None, "df":None, "log":None}
+    executor.submit(run_job, job, limit)
+    return redirect(url_for("view", job=job))
 
-@app.route("/start")
-def start():
-    job_id = f"{int(time.time()*1000):x}"[-12:]
-    JOBS[job_id] = {"status": "queued", "started": time.time(), "df_json": None, "log": []}
-    t = threading.Thread(target=_job_runner, args=(job_id,), daemon=True)
-    t.start()
-    return redirect(url_for("view", job=job_id), code=302)
-
-@app.route("/status")
-def status():
-    job_id = request.args.get("job", "")
-    return jsonify({**JOBS.get(job_id, {}), "job": job_id})
-
-@app.route("/view")
+@app.get("/view")
 def view():
-    job_id = request.args.get("job", "")
-    state = JOBS.get(job_id)
-    if not state:
-        return render_template_string(VIEW_HTML, job_id=job_id, status="error", err_msg="Job no encontrado", job_state={}, log_txt="")
-    log_txt = "\n".join(state.get("log", []))
-    df = state.get("df_json") or []
-    return render_template_string(
-        VIEW_HTML,
-        job_id=job_id,
-        status=state.get("status"),
-        job_state={**state, "job": job_id},
-        df=df,
-        log_txt=log_txt,
-        err_msg="",
-    )
+    job = request.args.get("job")
+    j = JOBS.get(job)
+    if not j:
+        return "Job not found", 404
+    df = j.get("df")
+    status = j["status"]
+    ctx = {
+        "title": f"Job {job}",
+        "job": job,
+        "status": status,
+        "started": j.get("started"),
+        "ended": j.get("ended"),
+        "columns": list(df.columns) if isinstance(df, pd.DataFrame) else [],
+        "df": df if isinstance(df, pd.DataFrame) else pd.DataFrame(),
+        "log": j.get("log"),
+    }
+    return render_template_string(HTML, **ctx)
+
+@app.get("/api")
+def job_json():
+    job = request.args.get("job")
+    j = JOBS.get(job)
+    if not j:
+        return jsonify({"error":"job not found"}), 404
+    if j["status"] != "done":
+        return jsonify({"job":job, "status":j["status"]})
+    return jsonify({
+        "job": job,
+        "status": "done",
+        "started": j.get("started"),
+        "ended": j.get("ended"),
+        "rows": j["raw"].to_dict(orient="records"),
+    })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # Para pruebas locales
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)

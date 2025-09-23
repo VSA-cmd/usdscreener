@@ -1,11 +1,19 @@
-ervices:
+services:
   - type: web
-    name: usdscreener
-    runtime: python
+    name: usdt-screener
+    env: python
     region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 600 --workers 1 --threads 4
+    startCommand: gunicorn app:app -w 2 -k gthread --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
-      - key: PYTHONUNBUFFERED
+    - key: PYTHONUNBUFFERED
         value: "1"
+      - key: FORCE_GLOBAL
+        value: "1"
+      - key: LIMIT_SYMBOLS
+        value: "150"
+      - key: MAX_WORKERS
+        value: "12"
+      - key: TIME_BUDGET_SECONDS
+        value: "110"
