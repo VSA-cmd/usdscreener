@@ -1,55 +1,38 @@
-# app.py
 import os
-import sys
 import json
 import time
 import uuid
 import shutil
 import threading
 import subprocess
-import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, List
 
-from flask import Flask, redirect, request, jsonify, send_file, url_for, Response, make_response
+from flask import Flask, Response, jsonify, redirect, request, send_file, make_response
+from python_decouple import config
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ---------------------------
 # Config
-# ────────────────────────────────────────────────────────────────────────────────
-LIMIT_SYMBOLS = int(os.getenv("LIMIT_SYMBOLS", "150"))
-MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "12"))
-BUDGET_SEC    = int(os.getenv("BUDGET", "110"))
+# ---------------------------
+LIMIT_SYMBOLS = int(config("LIMIT_SYMBOLS", default="150"))
+MAX_WORKERS = int(config("MAX_WORKERS", default="12"))
+BUDGET_SEC = int(config("BUDGET", default="110"))
 
-CSV_TMP_PATH  = Path("/tmp/usdt_screener.csv")
-JOBS_DIR      = Path("/tmp/jobs")
+CSV_TMP_PATH = Path("/tmp/usdt_screener.csv")
+JOBS_DIR = Path("/tmp/usd_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-ENGINE_CANDIDATES = ["Binance_usdt_2", "Binance_usdt"]
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Carga de motor (no obligatorio para fallback)
-# ────────────────────────────────────────────────────────────────────────────────
-engine = None
-engine_name: Optional[str] = None
-for mod in ENGINE_CANDIDATES:
-    try:
-        engine = __import__(mod)
-        engine_name = mod
-        break
-    except Exception:
-        continue
-
-# ────────────────────────────────────────────────────────────────────────────────
+# ---------------------------
 # App
-# ────────────────────────────────────────────────────────────────────────────────
+# ---------------------------
 app = Flask(__name__)
 
-JOBS_LOCK = threading.Lock()
-JOBS: Dict[str, Dict[str, Any]] = {}
-
+# ---------------------------
+# Utilidades
+# ---------------------------
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def job_json_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
@@ -57,173 +40,96 @@ def job_json_path(job_id: str) -> Path:
 def job_csv_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.csv"
 
-def save_job(job_id: str, payload: Dict[str, Any]) -> None:
-    payload["_engine"] = engine_name
-    payload["_updated_utc"] = now_utc_iso()
-    job_json_path(job_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    with JOBS_LOCK:
-        JOBS[job_id] = payload
-
-def load_job(job_id: str) -> Optional[Dict[str, Any]]:
+def save_job(job_id: str, meta: Dict[str, Any]) -> None:
     p = job_json_path(job_id)
-    if p.exists():
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    # Evitar caching de proxies
+    p.touch()
+
+def read_job(job_id: str) -> Optional[Dict[str, Any]]:
+    p = job_json_path(job_id)
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def gen_job_id() -> str:
+    return uuid.uuid4().hex[:10]
+
+def wait_for_file(path: Path, timeout: float = 12.0, poll: float = 0.25) -> bool:
+    """Espera hasta 'timeout' a que 'path' exista y tenga tamaño > 0."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
         try:
-            data = json.loads(p.read_text(encoding="utf-8") or "{}")
-            with JOBS_LOCK:
-                JOBS[job_id] = data
-            return data
+            if path.exists() and path.stat().st_size > 0:
+                return True
         except Exception:
-            return None
-    with JOBS_LOCK:
-        return JOBS.get(job_id)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Ejecución del motor
-# ────────────────────────────────────────────────────────────────────────────────
-def _call_engine_by_reflection() -> None:
-    """
-    Intenta invocar funciones típicas si el módulo se importa.
-    Si ninguna está presente, lanza RuntimeError para que el caller haga fallback.
-    """
-    if engine is None:
-        raise RuntimeError("No se pudo importar el motor (Binance_usdt_2 / Binance_usdt).")
-
-    import inspect
-
-    tried = []
-    preferred = [
-        "run_screener", "run", "main", "screener", "start", "execute",
-    ]
-    # También descubrimos funciones que contengan estas palabras
-    dynamic = []
-    for name in dir(engine):
-        if name.startswith("_"):
-            continue
-        obj = getattr(engine, name)
-        if callable(obj) and any(k in name.lower() for k in ("run", "main", "screener", "start", "exec")):
-            dynamic.append(name)
-
-    candidates = []
-    # mantén orden y unicidad
-    for n in preferred + dynamic:
-        if n not in candidates and hasattr(engine, n) and callable(getattr(engine, n)):
-            candidates.append(n)
-
-    if not candidates:
-        raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
-
-    # intentamos pasar sólo los kwargs aceptados por la firma
-    KW = {
-        "LIMIT_SYMBOLS": LIMIT_SYMBOLS,
-        "MAX_WORKERS": MAX_WORKERS,
-        "BUDGET": BUDGET_SEC,
-        # variantes en minúsculas por si las usan
-        "limit_symbols": LIMIT_SYMBOLS,
-        "max_workers": MAX_WORKERS,
-        "budget": BUDGET_SEC,
-    }
-
-    last_err = None
-    for name in candidates:
-        fn = getattr(engine, name)
-        tried.append(name)
-        try:
-            sig = inspect.signature(fn)
-            kwargs = {}
-            for p in sig.parameters.values():
-                if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL):
-                    continue
-                if p.name in KW:
-                    kwargs[p.name] = KW[p.name]
-            # preferimos kwargs; si ninguno coincide, llamamos sin args
-            if kwargs:
-                fn(**kwargs)  # type: ignore
-            else:
-                fn()  # type: ignore
-            return
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(
-        f"No pude ejecutar ninguna función del motor. Intentos={tried}. Último error: {last_err}"
-    )
-
-def _call_engine_as_script() -> None:
-    """
-    Ejecuta el motor como script con subprocess y espera a que termine.
-    Prioriza `python -m Binance_usdt_2` y `python Binance_usdt_2.py`.
-    Propaga LIMIT_SYMBOLS/MAX_WORKERS/BUDGET por variables de entorno.
-    """
-    env = os.environ.copy()
-    env.update({
-        "LIMIT_SYMBOLS": str(LIMIT_SYMBOLS),
-        "MAX_WORKERS": str(MAX_WORKERS),
-        "BUDGET": str(BUDGET_SEC),
-        "PYTHONUNBUFFERED": "1",
-    })
-
-    cmd_variants = []
-
-    # Si conocemos el nombre importable, primero prueba como módulo
-    if engine_name:
-        cmd_variants.append([sys.executable, "-u", "-m", engine_name])
-
-    # Después probamos posibles rutas de archivo
-    project_dir = Path(__file__).resolve().parent
-    for base in ENGINE_CANDIDATES:
-        py = project_dir / f"{base}.py"
-        if py.exists():
-            cmd_variants.append([sys.executable, "-u", str(py)])
-
-    if not cmd_variants:
-        raise RuntimeError("No encontré archivos del motor (Binance_usdt_2.py / Binance_usdt.py) en el proyecto.")
-
-    last_rc = None
-    last_out = None
-    last_err = None
-
-    for cmd in cmd_variants:
-        try:
-            print(f"→ Ejecutando motor como script: {' '.join(cmd)}")
-            cp = subprocess.run(
-                cmd,
-                env=env,
-                cwd=str(project_dir),
-                capture_output=True,
-                text=True,
-                timeout=max(BUDGET_SEC + 90, 180),   # margen de seguridad
-            )
-            last_rc, last_out, last_err = cp.returncode, cp.stdout, cp.stderr
-            print(last_out or "", end="")
-            if last_err:
-                print(last_err, file=sys.stderr, end="")
-            if cp.returncode == 0:
-                return
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("El motor excedió el tiempo máximo de ejecución (timeout).")
-
-    raise RuntimeError(f"El motor terminó con código {last_rc}. STDERR: {last_err}")
+            pass
+        time.sleep(poll)
+    return path.exists() and path.stat().st_size > 0
 
 def call_engine_and_wait() -> None:
     """
-    Deja el CSV en /tmp/usdt_screener.csv (o donde el motor lo genere).
-    Intenta reflexión; si no, fallback a script.
+    Intenta ejecutar el motor Binance_usdt_2 de varias formas.
+    Debe escribir /tmp/usdt_screener.csv.
     """
-    # 1) Intento por reflexión si el import funcionó
-    if engine is not None:
-        try:
-            _call_engine_by_reflection()
-        except RuntimeError:
-            # Si falla por “no hay funciones”, probamos como script
-            _call_engine_as_script()
-    else:
-        # Si no se pudo importar, vamos directo a script
-        _call_engine_as_script()
+    tried: List[str] = []
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Job runner
-# ────────────────────────────────────────────────────────────────────────────────
+    # 1) Importar y llamar funciones conocidas
+    try:
+        import Binance_usdt_2 as engine  # type: ignore
+        for fname in ("run_screener", "run", "main"):
+            fn = getattr(engine, fname, None)
+            if callable(fn):
+                tried.append(f"import:{fname}")
+                fn(LIMIT_SYMBOLS=LIMIT_SYMBOLS, MAX_WORKERS=MAX_WORKERS, BUDGET=BUDGET_SEC)
+                return
+            else:
+                tried.append(f"no:{fname}")
+    except Exception as e:
+        tried.append(f"import_error:{type(e).__name__}")
+
+    # 2) Ejecutar como módulo
+    try:
+        tried.append("subprocess:-m Binance_usdt_2")
+        subprocess.run(
+            ["python", "-m", "Binance_usdt_2"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=BUDGET_SEC + 30,
+        )
+        return
+    except Exception as e:
+        tried.append(f"mod_error:{type(e).__name__}")
+
+    # 3) Ejecutar el archivo directamente si existe
+    py_file = Path("Binance_usdt_2.py")
+    if py_file.exists():
+        try:
+            tried.append("subprocess:Binance_usdt_2.py")
+            subprocess.run(
+                ["python", str(py_file)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=BUDGET_SEC + 30,
+            )
+            return
+        except Exception as e:
+            tried.append(f"file_error:{type(e).__name__}")
+
+    raise RuntimeError(f"No encontré una función de entrada usable en el motor. Probé: {tried}")
+
+# ---------------------------
+# Trabajo en background
+# ---------------------------
 def background_job(job_id: str):
     started = time.perf_counter()
     meta: Dict[str, Any] = {
@@ -237,206 +143,235 @@ def background_job(job_id: str):
     save_job(job_id, meta)
 
     try:
+        # Ejecuta el motor
         call_engine_and_wait()
 
-        # Copiamos CSV global (si existe) a la carpeta del job
-        if CSV_TMP_PATH.exists():
-            shutil.copyfile(CSV_TMP_PATH, job_csv_path(job_id))
-        else:
-            # si el motor escribe en otro nombre, intenta detectarlo en /tmp
-            for cand in Path("/tmp").glob("*.csv"):
-                try:
-                    shutil.copyfile(cand, job_csv_path(job_id))
-                    break
-                except Exception:
-                    pass
+        # Espera a que /tmp/usdt_screener.csv aparezca
+        csv_ready = CSV_TMP_PATH.exists() and wait_for_file(CSV_TMP_PATH, timeout=12.0, poll=0.25)
 
-        rows = []
-        if job_csv_path(job_id).exists():
-            try:
-                import pandas as pd
-                df = pd.read_csv(job_csv_path(job_id))
-                rows = df.to_dict(orient="records")
-            except Exception as e:
-                print(f"⚠️  No pude leer el CSV del job {job_id}: {e}")
+        src_csv = None
+        if csv_ready:
+            src_csv = CSV_TMP_PATH
+        else:
+            # Buscar cualquier *.csv reciente en /tmp (fallback)
+            for cand in sorted(Path("/tmp").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if wait_for_file(cand, timeout=2.0, poll=0.2):
+                    src_csv = cand
+                    break
+
+        if not src_csv:
+            raise RuntimeError("El motor no produjo un CSV en /tmp (usdt_screener.csv u otro *.csv).")
+
+        # Copiar al CSV del job
+        dest = job_csv_path(job_id)
+        shutil.copyfile(src_csv, dest)
+
+        # Contar filas
+        count_rows = 0
+        try:
+            import pandas as pd  # noqa
+            import pandas  # noqa
+            df = pandas.read_csv(dest)
+            count_rows = int(df.shape[0])
+        except Exception as e:
+            raise RuntimeError(f"CSV copiado pero no se pudo leer: {e}")
+
+        if count_rows == 0:
+            raise RuntimeError("CSV generado pero sin filas.")
 
         meta.update({
             "status": "done",
             "ended": now_utc_iso(),
             "elapsed_sec": round(time.perf_counter() - started, 2),
-            "count": len(rows),
-            "rows": rows,
+            "count": count_rows,
+            "_engine": "Binance_usdt_2",
             "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
         })
         save_job(job_id, meta)
-    except Exception as e:
-        rows = []
-        if job_csv_path(job_id).exists():
-            try:
-                import pandas as pd
-                df = pd.read_csv(job_csv_path(job_id))
-                rows = df.to_dict(orient="records")
-            except Exception:
-                pass
 
+    except Exception as e:
         meta.update({
             "status": "error",
             "ended": now_utc_iso(),
             "elapsed_sec": round(time.perf_counter() - started, 2),
             "error": str(e),
-            "count": len(rows),
-            "rows": rows,
+            "count": 0,
         })
         save_job(job_id, meta)
         print(f"❌ Job {job_id} error: {e}")
 
-def start_new_job() -> str:
-    job_id = uuid.uuid4().hex[:10]
-    save_job(job_id, {
-        "job": job_id,
-        "status": "queued",
-        "started": now_utc_iso(),
-        "params": {"LIMIT_SYMBOLS": LIMIT_SYMBOLS, "MAX_WORKERS": MAX_WORKERS, "BUDGET": BUDGET_SEC},
-    })
-    t = threading.Thread(target=background_job, args=(job_id,), daemon=True)
-    t.start()
-    return job_id
+# ---------------------------
+# HTML (sin f-strings: JS toma ?job= de la URL)
+# ---------------------------
+VIEW_HTML = """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>USD Screener · Job</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial,sans-serif;margin:18px;color:#222}
+  .muted{color:#666;font-size:12px}
+  .pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:600}
+  .ok{background:#e6ffed;color:#036e1e;border:1px solid #9de2b0}
+  .run{background:#fffbe6;color:#8a6d3b;border:1px solid #eed68a}
+  .err{background:#ffecec;color:#b00020;border:1px solid #ff9aa2}
+  .btn{color:#0b57d0;text-decoration:none}
+  pre{background:#f6f8fa;border:1px solid #e5e7eb;border-radius:8px;padding:12px;overflow:auto}
+  .row{margin:8px 0}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+  <div id="app">
+    <div class="row"><strong id="title">Job</strong></div>
+    <div class="row" id="statusLine">
+      Estado: <span id="statusPill" class="pill run">cargando…</span>
+      <span class="muted" id="times"></span>
+      · <a id="jsonLink" class="btn" href="#" target="_blank" rel="noreferrer">Ver JSON</a>
+      · <a id="csvLink" class="btn" href="#" download>Descargar CSV</a>
+    </div>
+    <div id="errorBox" class="row hidden"></div>
+    <div class="row muted">Actualiza en unos segundos…</div>
+    <div class="row muted" id="rowsInfo"></div>
+  </div>
 
-# ────────────────────────────────────────────────────────────────────────────────
+<script>
+(function(){
+  const qs = new URLSearchParams(window.location.search);
+  const job = qs.get("job") || "";
+  const title = document.getElementById("title");
+  const pill = document.getElementById("statusPill");
+  const times = document.getElementById("times");
+  const jsonLink = document.getElementById("jsonLink");
+  const csvLink = document.getElementById("csvLink");
+  const errBox = document.getElementById("errorBox");
+  const rowsInfo = document.getElementById("rowsInfo");
+
+  function fmt(s){ return s ? s : ""; }
+  function setPill(status){
+    pill.textContent = status;
+    pill.classList.remove("ok","run","err");
+    if(status === "done") pill.classList.add("ok");
+    else if(status === "error") pill.classList.add("err");
+    else pill.classList.add("run");
+  }
+
+  function tick(){
+    if(!job){ title.textContent = "Sin job"; return; }
+    title.textContent = "Job " + job;
+    fetch("/api?job=" + encodeURIComponent(job), {cache:"no-store"})
+      .then(r => r.json())
+      .then(data => {
+        setPill(data.status || "running");
+        times.textContent = "· inicio: " + fmt(data.started) + " · fin: " + fmt(data.ended || "");
+        jsonLink.href = "/api?job=" + encodeURIComponent(job);
+        csvLink.href = "/csv?job=" + encodeURIComponent(job);
+
+        if (data.status === "done") {
+          rowsInfo.textContent = "Filas: " + (data.count || 0);
+        } else {
+          rowsInfo.textContent = "";
+        }
+
+        if (data.status === "error") {
+          errBox.classList.remove("hidden");
+          errBox.innerHTML = '<pre>' + (data.error || "Error desconocido") + '</pre>';
+        } else {
+          errBox.classList.add("hidden");
+          errBox.textContent = "";
+        }
+      })
+      .catch(_ => {});
+  }
+
+  tick();
+  setInterval(tick, 5000);
+})();
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------
 # Rutas
-# ────────────────────────────────────────────────────────────────────────────────
+# ---------------------------
 @app.after_request
 def no_cache(resp: Response):
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
     return resp
 
 @app.get("/")
 def index():
-    job_id = start_new_job()
-    return redirect(url_for("view_job", job=job_id), code=302)
+    # Crea un job nuevo y redirige a /view
+    job_id = gen_job_id()
+    t = threading.Thread(target=background_job, args=(job_id,), daemon=True)
+    t.start()
+    return redirect(f"/view?job={job_id}", code=302)
 
 @app.get("/view")
-def view_job():
-    job_id = request.args.get("job", "").strip() or start_new_job()
-
-    html = f"""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Job {job_id}</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial, sans-serif;
-           line-height:1.45; margin: 24px; color:#0f172a; }}
-    .muted {{ color:#64748b; font-size:.9rem; }}
-    .pill  {{ display:inline-block; padding:.2rem .5rem; border-radius:999px; background:#e2e8f0; }}
-    .ok    {{ background:#dcfce7; }}
-    .err   {{ background:#fee2e2; }}
-    a {{ color:#2563eb; text-decoration:none; }}
-    a:hover {{ text-decoration:underline; }}
-    .row {{ margin-top:.35rem; }}
-    .tiny {{ font-size:.85rem; }}
-  </style>
-</head>
-<body>
-  <h3 style="margin:0 0 12px 0;">Job {job_id}</h3>
-
-  <div id="status" class="row muted">Cargando estado...</div>
-  <div class="row tiny muted">Actualiza en unos segundos...</div>
-  <div id="links" class="row" style="margin-top:12px;"></div>
-
-  <script>
-    const jobId = {json.dumps(job_id)};
-    const st    = document.getElementById('status');
-    const links = document.getElementById('links');
-
-    function fmt(d) {{
-      if (!d) return '—';
-      return d;
-    }}
-
-    function render(data) {{
-      let badge = '<span class="pill">' + data.status + '</span>';
-      if (data.status === 'done')  badge = '<span class="pill ok">ok</span>';
-      if (data.status === 'error') badge = '<span class="pill err">error</span>';
-
-      st.innerHTML = `
-        <div class="row">Estado: ${{badge}}
-          · inicio: ${{fmt(data.started)}} · fin: ${{fmt(data.ended || '')}}
-          · <a href="/api?job=${{jobId}}" target="_blank">Ver JSON</a>
-          · <a href="/csv?job=${{jobId}}" id="csvlink">Descargar CSV</a>
-        </div>
-      `;
-
-      links.innerHTML = '';
-      if (data.error) {{
-        const p = document.createElement('div');
-        p.className = 'row tiny err';
-        p.textContent = data.error;
-        links.appendChild(p);
-      }}
-      if (data.count !== undefined) {{
-        const p = document.createElement('div');
-        p.className = 'row tiny muted';
-        p.textContent = 'Filas: ' + data.count + (data.elapsed_sec ? ' · t=' + data.elapsed_sec + 's' : '');
-        links.appendChild(p);
-      }}
-    }}
-
-    async function tick() {{
-      try {{
-        const r = await fetch('/api?job=' + jobId, {{ cache:'no-store' }});
-        if (r.status === 200) {{
-          const data = await r.json();
-          render(data);
-          if (data.status === 'done' || data.status === 'error') {{
-            clearInterval(h);
-          }}
-        }} else {{
-          st.textContent = 'Job no encontrado (aún).';
-        }}
-      }} catch(e) {{
-        st.textContent = 'Esperando...';
-      }}
-    }}
-    const h = setInterval(tick, 3500);
-    tick();
-  </script>
-</body>
-</html>"""
-    return make_response(html, 200)
+def view():
+    # HTML plano (no f-string) que lee ?job=... desde el propio JS
+    resp = make_response(VIEW_HTML, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
 
 @app.get("/api")
-def job_api():
-    job_id = (request.args.get("job") or "").strip()
+def api():
+    job_id = request.args.get("job", "").strip()
     if not job_id:
         return jsonify({"error": "job requerido"}), 400
-    data = load_job(job_id)
-    if not data:
-        return jsonify({"error": "Job not found", "job": job_id}), 404
-    return jsonify(data)
+    meta = read_job(job_id)
+    if not meta:
+        return jsonify({"error": "job no encontrado", "job": job_id}), 404
+    return jsonify(meta)
 
 @app.get("/csv")
-def job_csv():
-    job_id = (request.args.get("job") or "").strip()
+def csv_for_job():
+    job_id = request.args.get("job", "").strip()
     if not job_id:
-        return jsonify({"error": "job requerido"}), 400
-    csvp = job_csv_path(job_id)
-    if not csvp.exists():
-        return Response("CSV no listo", 202, mimetype="text/plain")
-    return send_file(csvp, as_attachment=True, download_name=f"usdt_screener_{job_id}.csv")
+        return Response("job requerido", status=400)
+    p = job_csv_path(job_id)
+    if not p.exists():
+        # Aún procesando
+        return Response("CSV aún no disponible", status=202)
+    return send_file(
+        str(p),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=f"usdt_screener_{job_id}.csv",
+        max_age=0,
+        conditional=False,
+        etag=False,
+        last_modified=None,
+    )
 
 @app.get("/csv_tmp")
 def csv_tmp():
-    if not CSV_TMP_PATH.exists():
-        return Response("No existe /tmp/usdt_screener.csv aún.", 404, mimetype="text/plain")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return send_file(CSV_TMP_PATH, as_attachment=True, download_name=f"usdt_screener_{ts}.csv")
+    # Sirve el CSV global en /tmp si existe (o el *.csv más reciente)
+    if CSV_TMP_PATH.exists() and CSV_TMP_PATH.stat().st_size > 0:
+        p = CSV_TMP_PATH
+    else:
+        cands = sorted(Path("/tmp").glob("*.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
+        p = cands[0] if cands else None
+    if not p:
+        return Response("No hay CSV en /tmp", status=404)
+    return send_file(
+        str(p),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=p.name,
+        max_age=0,
+        conditional=False,
+        etag=False,
+        last_modified=None,
+    )
 
-@app.get("/healthz")
-def healthz():
-    return jsonify({"ok": True, "time": now_utc_iso(), "engine": engine_name})
-
+# ---------------------------
+# WSGI (para gunicorn)
+# ---------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    # Útil en local
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True, threaded=True)
