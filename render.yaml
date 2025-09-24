@@ -5,7 +5,7 @@ services:
     region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app -w 2 -k gthread --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app -k uvicorn.workers.UvicornWorker -w 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
     - key: PYTHONUNBUFFERED
         value: "1"
@@ -17,3 +17,4 @@ services:
         value: "12"
       - key: TIME_BUDGET_SECONDS
         value: "110"
+

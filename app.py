@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, StreamingResponse, JSONResponse
-from python_decouple import config
+from decouple import config
 
 # ====== Config ======
 ENGINE_NAME = config("ENGINE", default="Binance_usdt_2")
